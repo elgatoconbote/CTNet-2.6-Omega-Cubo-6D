@@ -1,31 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CTNet process observer.
+CTNet contextual process observation.
 
-A CTNet system must be able to observe every process involved in its own
-response loop. This module provides neutral observation utilities for:
+Observation is not an external report. In CTNet every observation must become
+contextual mass again.
 
-- folded state components: Z, memory, relations, Cubo 6D, pad, Xi,
-- transitions between states,
-- u=p debt at multiple scales,
-- coherence tensor energy,
-- Cubo 6D closure values,
-- reversibility debt,
-- process deltas.
+This module observes an internal process as a new FoldedOmegaCuboState:
 
-It does not generate text and does not rank candidate text. It observes the
-system so that later training can close the full loop:
+    process:  state_before -> state_after
+    observe:  pack(before, after, delta)
+    fold:     observation mass [Z, M, R, C6, pad]
+    close:    CT coherence tensor + u=p
 
-    input -> internal process -> output chart -> product observation -> correction
-
-The invariant used by every observer is u=p closure.
+So the system can learn to observe its own internal processes in the same form
+as any other observation.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -33,57 +27,11 @@ import torch.nn.functional as F
 from ctnet_omega_cubo6d_plegado_ctnet26 import FoldedCTNetOmegaCubo26, FoldedOmegaCuboState
 
 
-@dataclass
-class TensorObservation:
-    name: str
-    mean: float
-    std: float
-    rms: float
-    abs_mean: float
-    up: float
-
-
-@dataclass
-class StateObservation:
-    z: TensorObservation
-    memory: TensorObservation
-    relations: TensorObservation
-    cubo: TensorObservation
-    pad: TensorObservation
-    xi: TensorObservation
-    coherence_energy: float
-    coherence_speed: float
-    coherence_info: float
-    cubo_residual: float
-    cubo_absorption: float
-    cubo_omega: float
-    cubo_closure_score: float
-
-
-@dataclass
-class TransitionObservation:
-    before: StateObservation
-    after: StateObservation
-    delta_xi: TensorObservation
-    delta_z: TensorObservation
-    delta_memory: TensorObservation
-    delta_relations: TensorObservation
-    delta_cubo: TensorObservation
-    reversibility_mae: float
-    transition_debt: float
-
-
-def _as_float(x: torch.Tensor) -> float:
-    return float(x.detach().to(torch.float32).mean().cpu())
-
-
 def _even_last_dim(x: torch.Tensor) -> torch.Tensor:
-    if x.shape[-1] % 2 == 0:
-        return x
-    return F.pad(x, (0, 1))
+    return x if x.shape[-1] % 2 == 0 else F.pad(x, (0, 1))
 
 
-def up_loss(x: torch.Tensor) -> torch.Tensor:
+def _up_mse_last_dim(x: torch.Tensor) -> torch.Tensor:
     x = _even_last_dim(x)
     h = x.shape[-1] // 2
     return F.mse_loss(x[..., :h], x[..., h:])
@@ -100,102 +48,115 @@ def _pool_tokens(x: torch.Tensor, scale: int) -> torch.Tensor:
 
 
 def multiscale_up_loss(x: torch.Tensor, *, token_scales: Tuple[int, ...] = (2, 4, 8)) -> torch.Tensor:
-    terms = [up_loss(x)]
+    terms = [_up_mse_last_dim(x)]
     for shift in (1, 2, 3):
         if x.shape[-1] > shift:
-            terms.append(up_loss(torch.roll(x, shifts=shift, dims=-1)))
+            terms.append(_up_mse_last_dim(torch.roll(x, shifts=shift, dims=-1)))
     if x.ndim == 3:
         for shift in (1, 2, 4):
             if x.shape[1] > shift:
-                terms.append(up_loss(torch.roll(x, shifts=shift, dims=1)))
+                terms.append(_up_mse_last_dim(torch.roll(x, shifts=shift, dims=1)))
         for scale in token_scales:
             if x.shape[1] >= scale:
                 pooled = _pool_tokens(x, scale)
-                terms.append(up_loss(pooled))
+                terms.append(_up_mse_last_dim(pooled))
                 if pooled.shape[1] > 1:
-                    terms.append(up_loss(torch.roll(pooled, shifts=1, dims=1)))
+                    terms.append(_up_mse_last_dim(torch.roll(pooled, shifts=1, dims=1)))
     return torch.stack(terms).mean()
 
 
-def observe_tensor(name: str, x: torch.Tensor) -> TensorObservation:
-    xf = x.detach().to(torch.float32)
-    return TensorObservation(
-        name=name,
-        mean=_as_float(xf),
-        std=_as_float(xf.std(unbiased=False)),
-        rms=_as_float(xf.pow(2).mean().sqrt()),
-        abs_mean=_as_float(xf.abs().mean()),
-        up=_as_float(multiscale_up_loss(x)),
-    )
+def _fold_signal(signal: torch.Tensor, shape: Tuple[int, ...]) -> torch.Tensor:
+    """Fold a [B,K] process signal into [B,*shape] without learned projection.
+
+    The fold is deterministic, differentiable, fixed-size and zero-cache. It is a
+    chart operation: if the signal is short, repeat it; if long, crop it.
+    """
+    batch = signal.shape[0]
+    need = 1
+    for s in shape:
+        need *= int(s)
+    if signal.shape[-1] < need:
+        reps = (need + signal.shape[-1] - 1) // signal.shape[-1]
+        signal = signal.repeat(1, reps)
+    return torch.tanh(signal[:, :need]).reshape(batch, *shape)
 
 
-def observe_state(model: FoldedCTNetOmegaCubo26, state: FoldedOmegaCuboState) -> StateObservation:
-    xi = model.pack(state)
-    coherence_energy, speed, info = model.core.coherence_energy(xi)
-    cubo_obs = model.cubo_observation(state)
-    return StateObservation(
-        z=observe_tensor("z", state.z),
-        memory=observe_tensor("memory", state.memory),
-        relations=observe_tensor("relations", state.relations),
-        cubo=observe_tensor("cubo", state.cubo),
-        pad=observe_tensor("pad", state.pad),
-        xi=observe_tensor("xi", xi),
-        coherence_energy=_as_float(coherence_energy),
-        coherence_speed=_as_float(speed),
-        coherence_info=_as_float(info),
-        cubo_residual=_as_float(cubo_obs["residual"]),
-        cubo_absorption=_as_float(cubo_obs["absorption"]),
-        cubo_omega=_as_float(cubo_obs["omega"]),
-        cubo_closure_score=_as_float(cubo_obs["closure_score"]),
-    )
-
-
-def observe_transition(
+def observe_process_as_mass(
     model: FoldedCTNetOmegaCubo26,
     before: FoldedOmegaCuboState,
-    after: Optional[FoldedOmegaCuboState] = None,
-) -> TransitionObservation:
-    if after is None:
-        after = model.forward_state(before)
+    after: FoldedOmegaCuboState,
+) -> FoldedOmegaCuboState:
+    """Turn an observed internal process into contextual mass.
 
-    before_obs = observe_state(model, before)
-    after_obs = observe_state(model, after)
-
+    This is the key point: the observation is not scalar diagnostics. It becomes
+    another CTNet state, so it can be processed by the same tensor of coherence
+    and the same u=p criterion.
+    """
+    L = model.layout
     xi_before = model.pack(before)
     xi_after = model.pack(after)
-    recovered = model.inverse_state(after)
-    reversibility_mae = (model.pack(recovered) - xi_before).abs().mean()
+    delta = xi_after - xi_before
 
-    delta_xi = xi_after - xi_before
-    delta_z = after.z - before.z
-    delta_memory = after.memory - before.memory
-    delta_relations = after.relations - before.relations
-    delta_cubo = after.cubo - before.cubo
-
-    transition_debt = (
-        multiscale_up_loss(delta_xi)
-        + multiscale_up_loss(after.z)
-        + multiscale_up_loss(after.memory)
-        + multiscale_up_loss(after.relations)
-        + multiscale_up_loss(after.cubo)
-        + 0.05 * model.core.coherence_energy(xi_after)[0]
-        + 0.25 * model.cubo_observation(after)["omega"].mean()
-        + 0.10 * reversibility_mae
-        - 0.10 * model.cubo_observation(after)["closure_score"].mean()
+    process_signal = torch.cat(
+        [
+            xi_before.reshape(xi_before.shape[0], -1),
+            xi_after.reshape(xi_after.shape[0], -1),
+            delta.reshape(delta.shape[0], -1),
+            before.cubo.reshape(before.cubo.shape[0], -1),
+            after.cubo.reshape(after.cubo.shape[0], -1),
+            (after.cubo - before.cubo).reshape(after.cubo.shape[0], -1),
+        ],
+        dim=-1,
     )
 
-    return TransitionObservation(
-        before=before_obs,
-        after=after_obs,
-        delta_xi=observe_tensor("delta_xi", delta_xi),
-        delta_z=observe_tensor("delta_z", delta_z),
-        delta_memory=observe_tensor("delta_memory", delta_memory),
-        delta_relations=observe_tensor("delta_relations", delta_relations),
-        delta_cubo=observe_tensor("delta_cubo", delta_cubo),
-        reversibility_mae=_as_float(reversibility_mae),
-        transition_debt=_as_float(transition_debt),
-    )
+    z = _fold_signal(process_signal, (L.z_tokens, L.z_dim))
+    memory = 0.01 * _fold_signal(torch.roll(process_signal, shifts=17, dims=-1), (L.mem_slots, L.mem_dim))
+    relations = 0.01 * _fold_signal(torch.roll(process_signal, shifts=43, dims=-1), (L.rel_edges, L.rel_dim))
+
+    if L.pad_size > 0:
+        pad = 0.01 * _fold_signal(torch.roll(process_signal, shifts=71, dims=-1), (L.pad_size,))
+    else:
+        pad = process_signal.new_zeros(process_signal.shape[0], 0)
+
+    cubo = model.cubo(z, memory, relations)["vector"].to(device=z.device, dtype=z.dtype)
+    return FoldedOmegaCuboState(z=z, memory=memory, relations=relations, cubo=cubo, pad=pad)
 
 
-def to_dict(obs) -> Dict:
-    return asdict(obs)
+def observation_mass_loss(
+    model: FoldedCTNetOmegaCubo26,
+    before: FoldedOmegaCuboState,
+    after: FoldedOmegaCuboState,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Differentiable closure loss for process observation-as-mass."""
+    obs_state = observe_process_as_mass(model, before, after)
+    obs_out = model.forward_state(obs_state)
+    xi_obs = model.pack(obs_out)
+    coh, _, _ = model.core.coherence_energy(xi_obs)
+    cubo_obs = model.cubo_observation(obs_out)
+    delta = xi_obs - model.pack(obs_state)
+
+    z_up = multiscale_up_loss(obs_out.z)
+    mem_up = multiscale_up_loss(obs_out.memory)
+    rel_up = multiscale_up_loss(obs_out.relations)
+    cubo_up = multiscale_up_loss(obs_out.cubo)
+    xi_up = multiscale_up_loss(xi_obs)
+    delta_up = multiscale_up_loss(delta)
+    up = torch.stack([z_up, mem_up, rel_up, cubo_up, xi_up, delta_up]).mean()
+
+    omega = cubo_obs["omega"].mean()
+    closure = cubo_obs["closure_score"].mean()
+    loss = up + 0.05 * coh + 0.25 * omega - 0.10 * closure
+    metrics = {
+        "obs_mass_loss": float(loss.detach().cpu()),
+        "obs_mass_up": float(up.detach().cpu()),
+        "obs_mass_coh": float(coh.detach().cpu()),
+        "obs_mass_omega": float(omega.detach().cpu()),
+        "obs_mass_closure": float(closure.detach().cpu()),
+        "obs_mass_z": float(z_up.detach().cpu()),
+        "obs_mass_memory": float(mem_up.detach().cpu()),
+        "obs_mass_relations": float(rel_up.detach().cpu()),
+        "obs_mass_cubo": float(cubo_up.detach().cpu()),
+        "obs_mass_xi": float(xi_up.detach().cpu()),
+        "obs_mass_delta": float(delta_up.detach().cpu()),
+    }
+    return loss, metrics
