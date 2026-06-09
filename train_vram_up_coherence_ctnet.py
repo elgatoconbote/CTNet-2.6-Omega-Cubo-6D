@@ -403,6 +403,52 @@ def loss_observador(
 
 
 
+
+def salida_visible_desde_estado(out: FoldedOmegaCuboState, *, max_chars: int = 512) -> str:
+    """
+    Convierte la voluntad de cierre del estado CTNet en acción textual visible.
+
+    No es next-token autoregresivo. Es una carta textual de efector:
+    estado deformado -> campo de cierre -> símbolos visibles.
+
+    El producto visible se reobserva después como Observador.
+    """
+    z = out.z.detach().to(torch.float32).flatten()
+    if z.numel() == 0:
+        return ""
+
+    # Normalización local: convierte la deformación en una trayectoria de símbolos.
+    z = torch.tanh(z)
+    vals = ((z + 1.0) * 0.5 * 94.0 + 32.0).clamp(32, 126).to(torch.int64)
+
+    chars = []
+    last = None
+    repeat = 0
+    for v in vals[: max_chars * 4]:
+        c = chr(int(v.item()))
+
+        # Evita una salida totalmente bloqueada por repeticiones largas.
+        if c == last:
+            repeat += 1
+            if repeat > 3:
+                continue
+        else:
+            repeat = 0
+            last = c
+
+        chars.append(c)
+        if len(chars) >= max_chars:
+            break
+
+    text = "".join(chars).strip()
+
+    # Si la carta sale casi vacía, emite al menos una acción visible mínima.
+    if not text:
+        text = "u=p"
+
+    return text
+
+
 def efector_textual(
     model: FoldedCTNetOmegaCubo26,
     state: FoldedOmegaCuboState,
@@ -425,6 +471,7 @@ def efector_textual(
     xi_in = model.pack(state)
     xi_out = model.pack(out)
     dxi = xi_out - xi_in
+    salida_visible = salida_visible_desde_estado(out)
 
     producto = "\n".join(
         [
@@ -448,6 +495,9 @@ def efector_textual(
             f"closure_score={_scalar(obs['closure_score']):.6e}",
             " ".join(f"{k}={v:.6e}" for k, v in sorted(up_metrics.items())),
             "<accion_visible>escribir_simbolos_para_cerrar_deformacion_contextual</accion_visible>",
+            "<salida_visible>",
+            salida_visible,
+            "</salida_visible>",
             "</producto_efector>",
         ]
     )
