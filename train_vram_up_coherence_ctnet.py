@@ -39,9 +39,12 @@ The final CTNet deformation is saved to disk by default.
 from __future__ import annotations
 
 import argparse
+import math
 import time
+import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, Iterator, List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -52,13 +55,140 @@ from ctnet_omega_cubo6d_plegado_ctnet26 import (
     FoldedOmegaCuboState,
     count_params,
 )
-from train_vram_strict_ctnet import (
-    DEFAULT_URLS,
-    OnlineSample,
-    batch_to_state,
-    online_blocks,
-    slot_variance,
-)
+
+
+DEFAULT_URLS = [
+    "https://www.gutenberg.org/cache/epub/1342/pg1342.txt",
+    "https://www.gutenberg.org/cache/epub/2701/pg2701.txt",
+]
+
+
+@dataclass
+class OnlineSample:
+    x: str
+    y: str
+    source: str
+    regime: str = "zero_disk_online_text"
+
+
+def _byte_signal(text: str, size: int, *, max_bytes: int = 2048) -> torch.Tensor:
+    raw = (text or "").encode("utf-8", errors="ignore")[:max_bytes]
+    if not raw:
+        raw = b"<empty>"
+    v = torch.zeros(size, dtype=torch.float32)
+    for i, b in enumerate(raw):
+        j = i % size
+        depth = 1.0 + (i // size)
+        v[j] += ((float(b) / 127.5) - 1.0) / math.sqrt(depth)
+    phase = torch.linspace(0, 2.0 * math.pi, size, dtype=torch.float32)
+    v = torch.tanh(v + 0.015 * torch.sin(phase) + 0.0075 * torch.cos(2.0 * phase))
+    return v
+
+
+def _text_tensor(text: str, shape: Tuple[int, ...], *, amp: float = 1.0, max_bytes: int = 2048) -> torch.Tensor:
+    n = 1
+    for s in shape:
+        n *= int(s)
+    return (amp * _byte_signal(text, n, max_bytes=max_bytes)).reshape(*shape)
+
+
+def _pad_anchor(batch: int, pad_size: int, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    if pad_size <= 0:
+        return torch.zeros(batch, 0, dtype=dtype, device=device)
+    phase = torch.linspace(0, 2.0 * math.pi, pad_size, dtype=dtype, device=device)
+    pad = 0.01 * (torch.sin(phase) + 0.5 * torch.cos(2.0 * phase))
+    return pad.unsqueeze(0).repeat(batch, 1)
+
+
+def _http_lines(url: str, *, timeout: float) -> Iterator[str]:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "CTNetZeroDisk/1.0 (+https://github.com/elgatoconbote/CTNet-2.6-Omega-Cubo-6D)",
+            "Accept": "text/plain,text/*,*/*;q=0.5",
+            "Cache-Control": "no-store",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        for raw in r:
+            yield raw.decode("utf-8", errors="ignore")
+
+
+def online_blocks(urls: List[str], *, block_bytes: int, timeout: float) -> Iterator[OnlineSample]:
+    if not urls:
+        urls = DEFAULT_URLS[:]
+
+    idx = 0
+    failures = 0
+    while True:
+        url = urls[idx % len(urls)]
+        idx += 1
+        try:
+            buf: List[str] = []
+            n = 0
+            for line in _http_lines(url, timeout=timeout):
+                if not line.strip():
+                    continue
+                buf.append(line)
+                n += len(line.encode("utf-8", errors="ignore"))
+                if n >= block_bytes:
+                    text = "".join(buf)[:block_bytes]
+                    target = text[1:] + " "
+                    yield OnlineSample(x=text, y=target, source=url)
+                    buf = []
+                    n = 0
+            if buf:
+                text = "".join(buf)[:block_bytes]
+                target = text[1:] + " "
+                yield OnlineSample(x=text, y=target, source=url)
+            failures = 0
+        except Exception as e:
+            failures += 1
+            print(f"source_error url={url!r} error={type(e).__name__}: {e}", flush=True)
+            if failures >= max(3, len(urls)):
+                raise RuntimeError("all online sources failed repeatedly; pass working --url values") from e
+
+
+def batch_to_state(
+    model: FoldedCTNetOmegaCubo26,
+    samples: List[OnlineSample],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    max_bytes: int,
+) -> Tuple[FoldedOmegaCuboState, torch.Tensor, List[str]]:
+    L = model.layout
+    batch = len(samples)
+
+    z_rows = []
+    mem_rows = []
+    rel_rows = []
+    target_z_rows = []
+    regimes = []
+
+    for ex in samples:
+        z_rows.append(_text_tensor(f"<regime>{ex.regime}</regime>\n{ex.x}", (L.z_tokens, L.z_dim), amp=1.0, max_bytes=max_bytes))
+        mem_rows.append(_text_tensor(f"<source>{ex.source}</source>\n<regime>{ex.regime}</regime>\n{ex.x}", (L.mem_slots, L.mem_dim), amp=0.01, max_bytes=max_bytes))
+        rel_rows.append(_text_tensor(f"<relations>{ex.regime}|{ex.source}</relations>\n{ex.x[:1024]}", (L.rel_edges, L.rel_dim), amp=0.01, max_bytes=max_bytes))
+        target_z_rows.append(_text_tensor(ex.y, (L.z_tokens, L.z_dim), amp=1.0, max_bytes=max_bytes))
+        regimes.append(ex.regime)
+
+    z = torch.stack(z_rows, dim=0).to(device=device, dtype=dtype, non_blocking=True)
+    memory = torch.stack(mem_rows, dim=0).to(device=device, dtype=dtype, non_blocking=True)
+    relations = torch.stack(rel_rows, dim=0).to(device=device, dtype=dtype, non_blocking=True)
+    target_z = torch.stack(target_z_rows, dim=0).to(device=device, dtype=dtype, non_blocking=True)
+    pad = _pad_anchor(batch, L.pad_size, dtype=dtype, device=device)
+
+    with torch.no_grad():
+        cubo0 = model.cubo(z, memory, relations)["vector"].to(device=device, dtype=dtype)
+
+    return FoldedOmegaCuboState(z=z, memory=memory, relations=relations, cubo=cubo0, pad=pad), target_z, regimes
+
+
+def slot_variance(x: torch.Tensor) -> torch.Tensor:
+    if x.shape[-2] <= 1:
+        return torch.zeros((), device=x.device, dtype=x.dtype)
+    return x.var(dim=-2, unbiased=False).mean()
 
 
 def _even_last_dim(x: torch.Tensor) -> torch.Tensor:
@@ -91,15 +221,12 @@ def multiscale_up_loss(x: torch.Tensor, *, token_scales: Tuple[int, ...] = (2, 4
     """u=p loss across scales and perspectives for one tensor."""
     terms: List[torch.Tensor] = []
 
-    # Raw perspective.
     terms.append(_up_mse_last_dim(x))
 
-    # Channel perspectives: same state, rotated feature chart.
     for shift in (1, 2, 3):
         if x.shape[-1] > shift:
             terms.append(_up_mse_last_dim(torch.roll(x, shifts=shift, dims=-1)))
 
-    # Token perspectives for [B,N,D].
     if x.ndim == 3:
         for shift in (1, 2, 4):
             if x.shape[1] > shift:
@@ -131,8 +258,6 @@ def all_perspective_up_loss(
     xi_up = multiscale_up_loss(xi_out)
     delta_up = multiscale_up_loss(delta)
 
-    # The deformation must also remain coherent, but we do not force it to zero;
-    # we force its u/p modes to agree.
     total = torch.stack([z_up, mem_up, rel_up, cubo_up, xi_up, delta_up]).mean()
     metrics = {
         "up_total": float(total.detach().cpu()),
