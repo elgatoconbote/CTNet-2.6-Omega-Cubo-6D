@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+CTNet 2.6 Omega Cubo 6D trainer with u=p coherence as the primary signal.
+
+The surface training loop can look close to a standard online trainer: stream text,
+encode a fixed state, run CTNet, compute a loss, update weights.
+
+The difference is what the loss means.
+
+In this trainer the central criterion is not merely next-byte prediction and not
+candidate ranking. The central criterion is CTNet coherence:
+
+    u = p
+
+at every scale and from every perspective that the fixed CTNet state exposes.
+
+Perspectives measured:
+- Z state,
+- fixed memory M,
+- fixed relation bank R,
+- Cubo 6D coordinates C6,
+- full packed state Xi,
+- deformation DeltaXi = Xi_out - Xi_in.
+
+Scales / perspectives measured:
+- raw split on the last dimension,
+- token pooling at scales 2, 4, 8 when a token axis exists,
+- token rolls when a token axis exists,
+- channel rolls along the feature axis.
+
+The byte/text target remains only as an anchoring task. It keeps the chart tied to
+language, but the main signal is modal closure u/p plus the CTNet coherence tensor.
+
+No corpus cache, no Hugging Face datasets, no pyarrow, no vector store, no KV-cache.
+The final CTNet deformation is saved to disk by default.
+"""
+
+from __future__ import annotations
+
+import argparse
+import time
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import torch
+import torch.nn.functional as F
+
+from ctnet_omega_cubo6d_plegado_ctnet26 import (
+    FoldLayout,
+    FoldedCTNetOmegaCubo26,
+    FoldedOmegaCuboState,
+    count_params,
+)
+from train_vram_strict_ctnet import (
+    DEFAULT_URLS,
+    OnlineSample,
+    batch_to_state,
+    online_blocks,
+    slot_variance,
+)
+
+
+def _even_last_dim(x: torch.Tensor) -> torch.Tensor:
+    if x.shape[-1] % 2 == 0:
+        return x
+    return F.pad(x, (0, 1))
+
+
+def _up_mse_last_dim(x: torch.Tensor) -> torch.Tensor:
+    x = _even_last_dim(x)
+    d2 = x.shape[-1] // 2
+    u = x[..., :d2]
+    p = x[..., d2:]
+    return F.mse_loss(u, p)
+
+
+def _pool_tokens(x: torch.Tensor, scale: int) -> torch.Tensor:
+    """Pool token axis of [B,N,D] by averaging groups."""
+    if x.ndim != 3 or x.shape[1] < scale:
+        return x
+    b, n, d = x.shape
+    usable = (n // scale) * scale
+    if usable <= 0:
+        return x
+    y = x[:, :usable, :].reshape(b, usable // scale, scale, d).mean(dim=2)
+    return y
+
+
+def multiscale_up_loss(x: torch.Tensor, *, token_scales: Tuple[int, ...] = (2, 4, 8)) -> torch.Tensor:
+    """u=p loss across scales and perspectives for one tensor."""
+    terms: List[torch.Tensor] = []
+
+    # Raw perspective.
+    terms.append(_up_mse_last_dim(x))
+
+    # Channel perspectives: same state, rotated feature chart.
+    for shift in (1, 2, 3):
+        if x.shape[-1] > shift:
+            terms.append(_up_mse_last_dim(torch.roll(x, shifts=shift, dims=-1)))
+
+    # Token perspectives for [B,N,D].
+    if x.ndim == 3:
+        for shift in (1, 2, 4):
+            if x.shape[1] > shift:
+                terms.append(_up_mse_last_dim(torch.roll(x, shifts=shift, dims=1)))
+        for scale in token_scales:
+            if x.shape[1] >= scale:
+                pooled = _pool_tokens(x, scale)
+                terms.append(_up_mse_last_dim(pooled))
+                if pooled.shape[1] > 1:
+                    terms.append(_up_mse_last_dim(torch.roll(pooled, shifts=1, dims=1)))
+
+    return torch.stack(terms).mean()
+
+
+def all_perspective_up_loss(
+    model: FoldedCTNetOmegaCubo26,
+    state: FoldedOmegaCuboState,
+    out: FoldedOmegaCuboState,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Compute u=p across every exposed CTNet perspective."""
+    xi_in = model.pack(state)
+    xi_out = model.pack(out)
+    delta = xi_out - xi_in
+
+    z_up = multiscale_up_loss(out.z)
+    mem_up = multiscale_up_loss(out.memory)
+    rel_up = multiscale_up_loss(out.relations)
+    cubo_up = multiscale_up_loss(out.cubo)
+    xi_up = multiscale_up_loss(xi_out)
+    delta_up = multiscale_up_loss(delta)
+
+    # The deformation must also remain coherent, but we do not force it to zero;
+    # we force its u/p modes to agree.
+    total = torch.stack([z_up, mem_up, rel_up, cubo_up, xi_up, delta_up]).mean()
+    metrics = {
+        "up_total": float(total.detach().cpu()),
+        "up_z": float(z_up.detach().cpu()),
+        "up_memory": float(mem_up.detach().cpu()),
+        "up_relations": float(rel_up.detach().cpu()),
+        "up_cubo": float(cubo_up.detach().cpu()),
+        "up_xi": float(xi_up.detach().cpu()),
+        "up_delta": float(delta_up.detach().cpu()),
+    }
+    return total, metrics
+
+
+def train(args: argparse.Namespace) -> Dict:
+    device = torch.device("cuda" if args.cuda and torch.cuda.is_available() else "cpu")
+    dtype = torch.float64 if args.fp64 else torch.float32
+
+    layout = FoldLayout(
+        N=args.N,
+        d=args.d,
+        z_tokens=args.z_tokens,
+        z_dim=args.z_dim,
+        mem_slots=args.mem_slots,
+        mem_dim=args.mem_dim,
+        rel_edges=args.rel_edges,
+        rel_dim=args.rel_dim,
+    )
+    layout.validate()
+
+    model = FoldedCTNetOmegaCubo26(
+        layout=layout,
+        fractal_steps=args.fractal_steps,
+        latent_steps=args.latent_steps,
+        cubo_shear=args.cubo_shear,
+    ).to(device=device, dtype=dtype)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
+    stream = online_blocks(args.url, block_bytes=args.block_bytes, timeout=args.timeout)
+
+    print("=== CTNet u=p multiscale coherence training ===", flush=True)
+    print("objective=u=p at all exposed scales/perspectives + CT coherence tensor", flush=True)
+    print("loader=no datasets/no huggingface_hub/no pyarrow/no xet", flush=True)
+    print(f"device={device} dtype={dtype} params={count_params(model)}", flush=True)
+    print(f"layout capacity={layout.capacity} semantic_size={layout.semantic_size} pad_size={layout.pad_size}", flush=True)
+    print(f"fixed memory M=[B,{layout.mem_slots},{layout.mem_dim}] relations R=[B,{layout.rel_edges},{layout.rel_dim}]", flush=True)
+    print(f"urls={args.url or DEFAULT_URLS}", flush=True)
+    print(f"save_final={args.save_final}", flush=True)
+
+    t0 = time.time()
+    last: Dict = {}
+
+    for step in range(1, args.steps + 1):
+        samples: List[OnlineSample] = [next(stream) for _ in range(args.batch)]
+        state, target_z, regimes = batch_to_state(model, samples, device=device, dtype=dtype, max_bytes=args.max_bytes)
+
+        optimizer.zero_grad(set_to_none=True)
+        out = model.forward_state(state)
+        xi_out = model.pack(out)
+
+        loss_up, up_metrics = all_perspective_up_loss(model, state, out)
+        loss_anchor = F.mse_loss(out.z, target_z)
+        loss_coh, speed, info = model.core.coherence_energy(xi_out)
+        obs = model.cubo_observation(out)
+        loss_omega = obs["omega"].mean()
+        loss_cubo_track = F.mse_loss(out.cubo, obs["vector"].detach())
+
+        mem_var = slot_variance(out.memory)
+        rel_var = slot_variance(out.relations)
+        loss_structure = F.relu(args.min_slot_var - mem_var) + F.relu(args.min_slot_var - rel_var)
+
+        if args.reversibility_loss_every > 0 and step % args.reversibility_loss_every == 0:
+            recovered = model.inverse_state(out)
+            loss_rev = F.mse_loss(model.pack(recovered), model.pack(state))
+        else:
+            loss_rev = torch.zeros((), device=device, dtype=dtype)
+
+        loss = (
+            args.lambda_up * loss_up
+            + args.lambda_anchor * loss_anchor
+            + args.lambda_coh * loss_coh
+            + args.lambda_omega * loss_omega
+            + args.lambda_cubo * loss_cubo_track
+            + args.lambda_structure * loss_structure
+            + args.lambda_rev * loss_rev
+        )
+        loss.backward()
+
+        if args.coherence_grad_scale:
+            with torch.no_grad():
+                scale = float(torch.clamp(speed.detach().to(torch.float32), args.grad_scale_min, args.grad_scale_max).cpu())
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.mul_(scale)
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+        optimizer.step()
+
+        if args.empty_cache_every > 0 and step % args.empty_cache_every == 0 and device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        if step % args.log_every == 0 or step == 1:
+            elapsed = time.time() - t0
+            last = {
+                "step": step,
+                "loss": float(loss.detach().cpu()),
+                "loss_up": float(loss_up.detach().cpu()),
+                "loss_anchor": float(loss_anchor.detach().cpu()),
+                "loss_coh": float(loss_coh.detach().cpu()),
+                "loss_omega": float(loss_omega.detach().cpu()),
+                "loss_rev": float(loss_rev.detach().cpu()),
+                "speed": float(speed.detach().cpu()),
+                "info": float(info.detach().cpu()),
+                "omega": float(obs["omega"].mean().detach().cpu()),
+                "residual": float(obs["residual"].mean().detach().cpu()),
+                "absorption": float(obs["absorption"].mean().detach().cpu()),
+                "closure_score": float(obs["closure_score"].mean().detach().cpu()),
+                "mem_slot_var": float(mem_var.detach().cpu()),
+                "rel_slot_var": float(rel_var.detach().cpu()),
+                "elapsed_sec": elapsed,
+                "source": samples[0].source,
+                "regimes": regimes,
+                **up_metrics,
+            }
+            print(
+                f"step {step:6d} | loss={last['loss']:.6e} up={last['loss_up']:.3e} "
+                f"z={last['up_z']:.2e} m={last['up_memory']:.2e} r={last['up_relations']:.2e} "
+                f"c6={last['up_cubo']:.2e} xi={last['up_xi']:.2e} dxi={last['up_delta']:.2e} "
+                f"anchor={last['loss_anchor']:.3e} omega={last['omega']:.1e} "
+                f"coh={last['loss_coh']:.3e} rev={last['loss_rev']:.1e} time={elapsed:.1f}s",
+                flush=True,
+            )
+
+    if args.save_final:
+        path = Path(args.save_final)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"model_state_dict": model.state_dict(), "last": last, "args": vars(args)}, path)
+        print(f"saved_final={path}", flush=True)
+
+    return last
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="CTNet trainer where u=p multiscale coherence is primary.")
+    p.add_argument("--url", action="append", default=[], help="Direct text URL to stream. Can be passed multiple times.")
+    p.add_argument("--timeout", type=float, default=20.0)
+    p.add_argument("--block-bytes", type=int, default=2048)
+    p.add_argument("--steps", type=int, default=1000)
+    p.add_argument("--batch", type=int, default=1)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--cuda", action="store_true")
+    p.add_argument("--fp64", action="store_true")
+    p.add_argument("--max-bytes", type=int, default=2048)
+
+    p.add_argument("--N", type=int, default=64)
+    p.add_argument("--d", type=int, default=16)
+    p.add_argument("--z-tokens", type=int, default=32)
+    p.add_argument("--z-dim", type=int, default=16)
+    p.add_argument("--mem-slots", type=int, default=8)
+    p.add_argument("--mem-dim", type=int, default=16)
+    p.add_argument("--rel-edges", type=int, default=8)
+    p.add_argument("--rel-dim", type=int, default=16)
+    p.add_argument("--fractal-steps", type=int, default=4)
+    p.add_argument("--latent-steps", type=int, default=2)
+    p.add_argument("--cubo-shear", type=float, default=0.05)
+
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--weight-decay", type=float, default=1e-2)
+    p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument("--coherence-grad-scale", action="store_true")
+    p.add_argument("--grad-scale-min", type=float, default=0.5)
+    p.add_argument("--grad-scale-max", type=float, default=5.0)
+
+    p.add_argument("--lambda-up", type=float, default=1.0)
+    p.add_argument("--lambda-anchor", type=float, default=0.10)
+    p.add_argument("--lambda-coh", type=float, default=0.05)
+    p.add_argument("--lambda-omega", type=float, default=0.25)
+    p.add_argument("--lambda-cubo", type=float, default=0.05)
+    p.add_argument("--lambda-structure", type=float, default=0.10)
+    p.add_argument("--lambda-rev", type=float, default=0.10)
+    p.add_argument("--reversibility-loss-every", type=int, default=10)
+    p.add_argument("--min-slot-var", type=float, default=1e-8)
+
+    p.add_argument("--log-every", type=int, default=10)
+    p.add_argument("--empty-cache-every", type=int, default=25)
+    p.add_argument("--save-final", default="checkpoints/ctnet_up_state_final.pt")
+
+    args = p.parse_args()
+    torch.manual_seed(args.seed)
+    train(args)
+
+
+if __name__ == "__main__":
+    main()
