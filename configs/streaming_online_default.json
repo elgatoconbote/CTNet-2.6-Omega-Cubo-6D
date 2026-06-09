@@ -1,0 +1,65 @@
+{
+  "description": "CTNet 2.6 Omega Cubo 6D online streaming default run. No corpus download.",
+  "no_corpus_download": true,
+  "fixed_memory": true,
+  "datasets": {
+    "fineweb_edu": {
+      "repo": "HuggingFaceFW/fineweb-edu",
+      "name": "sample-10BT",
+      "probability": 0.55,
+      "streaming": true
+    },
+    "openwebmath": {
+      "repo": "open-web-math/open-web-math",
+      "probability": 0.25,
+      "streaming": true
+    },
+    "numina_math_cot": {
+      "repo": "AI-MO/NuminaMath-CoT",
+      "probability": 0.15,
+      "streaming": true,
+      "allowed_sources": [
+        "aops_forum",
+        "amc_aime",
+        "cn_k12",
+        "gsm8k",
+        "math",
+        "olympiads"
+      ],
+      "excluded_sources": [
+        "synthetic_amc",
+        "synthetic_math",
+        "orca_math"
+      ]
+    },
+    "swe_bench": {
+      "repo": "princeton-nlp/SWE-bench",
+      "probability": 0.05,
+      "streaming": true
+    }
+  },
+  "layout": {
+    "N": 64,
+    "d": 16,
+    "z_tokens": 32,
+    "z_dim": 16,
+    "mem_slots": 8,
+    "mem_dim": 16,
+    "rel_edges": 8,
+    "rel_dim": 16
+  },
+  "training": {
+    "steps": 1000,
+    "batch": 2,
+    "lr": 0.0003,
+    "weight_decay": 0.01,
+    "coherence_grad_scale": true,
+    "lambda_task": 1.0,
+    "lambda_coh": 0.05,
+    "lambda_omega": 0.25,
+    "lambda_cubo": 0.05,
+    "lambda_structure": 0.1,
+    "lambda_rev": 0.1,
+    "reversibility_loss_every": 10
+  }
+}
