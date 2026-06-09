@@ -3,10 +3,10 @@
 """
 CTNet 2.6 Omega Cubo 6D trainer with u=p coherence as the primary signal.
 
-Every observed stream is dataset. External text and CTNet's own internal
-processes enter through the same path:
+Every observer is contextual reality. External reality and CTNet's own internal
+processes enter through the same observer path:
 
-    observation -> OnlineSample -> batch_to_state -> contextual mass -> CTNet -> u=p
+    observation -> Observador -> batch_to_state -> contextual mass -> CTNet -> u=p
 
 There is no external observer module. CTNet observes while it runs, and what it
 observes becomes contextual mass through the same chart used by the external
@@ -73,7 +73,7 @@ DEFAULT_URLS = [
 
 
 @dataclass
-class OnlineSample:
+class Observador:
     x: str
     y: str
     source: str
@@ -123,7 +123,7 @@ def _http_lines(url: str, *, timeout: float) -> Iterator[str]:
             yield raw.decode("utf-8", errors="ignore")
 
 
-def online_blocks(urls: List[str], *, block_bytes: int, timeout: float) -> Iterator[OnlineSample]:
+def flujo_observadores(urls: List[str], *, block_bytes: int, timeout: float) -> Iterator[Observador]:
     if not urls:
         urls = DEFAULT_URLS[:]
 
@@ -143,13 +143,13 @@ def online_blocks(urls: List[str], *, block_bytes: int, timeout: float) -> Itera
                 if n >= block_bytes:
                     text = "".join(buf)[:block_bytes]
                     target = text[1:] + " "
-                    yield OnlineSample(x=text, y=target, source=url)
+                    yield Observador(x=text, y=target, source=url)
                     buf = []
                     n = 0
             if buf:
                 text = "".join(buf)[:block_bytes]
                 target = text[1:] + " "
-                yield OnlineSample(x=text, y=target, source=url)
+                yield Observador(x=text, y=target, source=url)
             failures = 0
         except Exception as e:
             failures += 1
@@ -160,7 +160,7 @@ def online_blocks(urls: List[str], *, block_bytes: int, timeout: float) -> Itera
 
 def batch_to_state(
     model: FoldedCTNetOmegaCubo26,
-    samples: List[OnlineSample],
+    samples: List[Observador],
     *,
     device: torch.device,
     dtype: torch.dtype,
@@ -294,7 +294,7 @@ def _tensor_reality_line(name: str, x: torch.Tensor) -> str:
     )
 
 
-def internal_reality_sample(
+def observador_interno(
     model: FoldedCTNetOmegaCubo26,
     state: FoldedOmegaCuboState,
     out: FoldedOmegaCuboState,
@@ -302,13 +302,13 @@ def internal_reality_sample(
     step: int,
     obs: Dict[str, torch.Tensor],
     up_metrics: Dict[str, float],
-) -> OnlineSample:
+) -> Observador:
     """
     CTNet observes its own running process exactly as it observes any dataset item.
 
     This is not an external observer and not a diagnostic module. It serializes the
     current internal transition as observed reality, then feeds it back through the
-    same OnlineSample -> batch_to_state -> contextual mass route used by external
+    same Observador -> batch_to_state -> contextual mass route used by external
     text.
 
     Everything observed is dataset.
@@ -346,7 +346,7 @@ def internal_reality_sample(
         ]
     )
 
-    return OnlineSample(
+    return Observador(
         x=text,
         y=text[1:] + " ",
         source="ctnet://internal_process",
@@ -354,9 +354,9 @@ def internal_reality_sample(
     )
 
 
-def observed_stream_loss(
+def loss_observador(
     model: FoldedCTNetOmegaCubo26,
-    sample: OnlineSample,
+    sample: Observador,
     *,
     device: torch.device,
     dtype: torch.dtype,
@@ -366,7 +366,7 @@ def observed_stream_loss(
     """
     Trains an observed internal process through the same chart as the dataset.
 
-    observed process -> OnlineSample -> batch_to_state -> contextual mass -> CTNet -> u=p
+    observed process -> Observador -> batch_to_state -> contextual mass -> CTNet -> u=p
     """
     obs_state, obs_target_z, _ = batch_to_state(
         model,
@@ -426,11 +426,11 @@ def train(args: argparse.Namespace) -> Dict:
     ).to(device=device, dtype=dtype)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
-    stream = online_blocks(args.url, block_bytes=args.block_bytes, timeout=args.timeout)
+    stream = flujo_observadores(args.url, block_bytes=args.block_bytes, timeout=args.timeout)
 
     print("=== CTNet u=p multiscale coherence training ===", flush=True)
     print("objective=u=p at all exposed scales/perspectives + CT coherence tensor", flush=True)
-    print("self_observation=internal processes are fed through the same dataset chart", flush=True)
+    print("self_observation=internal processes are fed through the same observer chart", flush=True)
     print("loader=no datasets/no huggingface_hub/no pyarrow/no xet", flush=True)
     print(f"device={device} dtype={dtype} params={count_params(model)}", flush=True)
     print(f"layout capacity={layout.capacity} semantic_size={layout.semantic_size} pad_size={layout.pad_size}", flush=True)
@@ -442,7 +442,7 @@ def train(args: argparse.Namespace) -> Dict:
     last: Dict = {}
 
     for step in range(1, args.steps + 1):
-        samples: List[OnlineSample] = [next(stream) for _ in range(args.batch)]
+        samples: List[Observador] = [next(stream) for _ in range(args.batch)]
         state, target_z, regimes = batch_to_state(model, samples, device=device, dtype=dtype, max_bytes=args.max_bytes)
 
         optimizer.zero_grad(set_to_none=True)
@@ -457,7 +457,7 @@ def train(args: argparse.Namespace) -> Dict:
         loss_cubo_track = F.mse_loss(out.cubo, obs["vector"].detach())
 
         if args.self_observation_every > 0 and step % args.self_observation_every == 0:
-            internal_sample = internal_reality_sample(
+            internal_sample = observador_interno(
                 model,
                 state,
                 out,
@@ -465,7 +465,7 @@ def train(args: argparse.Namespace) -> Dict:
                 obs=obs,
                 up_metrics=up_metrics,
             )
-            loss_internal_stream, internal_metrics = observed_stream_loss(
+            loss_internal_stream, internal_metrics = loss_observador(
                 model,
                 internal_sample,
                 device=device,
