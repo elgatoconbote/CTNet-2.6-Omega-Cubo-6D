@@ -402,6 +402,97 @@ def loss_observador(
     return loss_obs_stream, metrics
 
 
+
+def efector_textual(
+    model: FoldedCTNetOmegaCubo26,
+    state: FoldedOmegaCuboState,
+    out: FoldedOmegaCuboState,
+    *,
+    step: int,
+    obs: Dict[str, torch.Tensor],
+    up_metrics: Dict[str, float],
+) -> Observador:
+    """
+    Efector textual de CTNet.
+
+    No es un decoder autoregresivo. Es una carta de acción visible:
+    el estado deformado genera una voluntad de cierre y esa voluntad se
+    reinscribe como producto textual observable.
+
+    pregunta/entrada -> deformación -> voluntad de cierre -> efector -> producto
+    producto -> Observador -> batch_to_state -> masa contextual -> u=p
+    """
+    xi_in = model.pack(state)
+    xi_out = model.pack(out)
+    dxi = xi_out - xi_in
+
+    producto = "\n".join(
+        [
+            "<producto_efector>",
+            "<tipo>textual</tipo>",
+            "<principio>u=p</principio>",
+            "<respuesta>voluntad_de_cierre</respuesta>",
+            "<sentido>CTNet_responde_porque_la_pregunta_deforma_estado</sentido>",
+            "<criterio>la_accion_correcta_es_el_cierre_mas_coherente</criterio>",
+            f"step={step}",
+            _tensor_reality_line("estado_deformado_z", out.z),
+            _tensor_reality_line("estado_deformado_memory", out.memory),
+            _tensor_reality_line("estado_deformado_relations", out.relations),
+            _tensor_reality_line("estado_deformado_cubo", out.cubo),
+            _tensor_reality_line("xi_in", xi_in),
+            _tensor_reality_line("xi_out", xi_out),
+            _tensor_reality_line("delta_xi", dxi),
+            f"omega={_scalar(obs['omega']):.6e}",
+            f"residual={_scalar(obs['residual']):.6e}",
+            f"absorption={_scalar(obs['absorption']):.6e}",
+            f"closure_score={_scalar(obs['closure_score']):.6e}",
+            " ".join(f"{k}={v:.6e}" for k, v in sorted(up_metrics.items())),
+            "<accion_visible>escribir_simbolos_para_cerrar_deformacion_contextual</accion_visible>",
+            "</producto_efector>",
+        ]
+    )
+
+    return Observador(
+        x=producto,
+        y=producto[1:] + " ",
+        source="ctnet://efector/textual",
+        regime="producto_efector_textual",
+    )
+
+
+def loss_efector(
+    model: FoldedCTNetOmegaCubo26,
+    producto: Observador,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    max_bytes: int,
+    args: argparse.Namespace,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    El producto del efector vuelve a entrar como observación.
+
+    producto visible -> Observador -> batch_to_state -> masa contextual -> CTNet -> u=p
+    """
+    loss, metrics = loss_observador(
+        model,
+        producto,
+        device=device,
+        dtype=dtype,
+        max_bytes=max_bytes,
+        args=args,
+    )
+
+    renamed = {}
+    for k, v in metrics.items():
+        renamed[k.replace("internal", "efector")] = v
+
+    if "loss_efector_stream" not in renamed:
+        renamed["loss_efector_stream"] = float(loss.detach().cpu())
+
+    return loss, renamed
+
+
 def train(args: argparse.Namespace) -> Dict:
     device = torch.device("cuda" if args.cuda and torch.cuda.is_available() else "cpu")
     dtype = torch.float64 if args.fp64 else torch.float32
@@ -431,6 +522,7 @@ def train(args: argparse.Namespace) -> Dict:
     print("=== CTNet u=p multiscale coherence training ===", flush=True)
     print("objective=u=p at all exposed scales/perspectives + CT coherence tensor", flush=True)
     print("self_observation=internal processes are fed through the same observer chart", flush=True)
+    print("efector=textual product is observed back through the same observer chart", flush=True)
     print("loader=no datasets/no huggingface_hub/no pyarrow/no xet", flush=True)
     print(f"device={device} dtype={dtype} params={count_params(model)}", flush=True)
     print(f"layout capacity={layout.capacity} semantic_size={layout.semantic_size} pad_size={layout.pad_size}", flush=True)
@@ -483,6 +575,33 @@ def train(args: argparse.Namespace) -> Dict:
                 "loss_internal_omega": 0.0,
             }
 
+        if args.efector_every > 0 and step % args.efector_every == 0:
+            producto_efector = efector_textual(
+                model,
+                state,
+                out,
+                step=step,
+                obs=obs,
+                up_metrics=up_metrics,
+            )
+            loss_efector_stream, efector_metrics = loss_efector(
+                model,
+                producto_efector,
+                device=device,
+                dtype=dtype,
+                max_bytes=args.max_bytes,
+                args=args,
+            )
+        else:
+            loss_efector_stream = torch.zeros((), device=device, dtype=dtype)
+            efector_metrics = {
+                "loss_efector_stream": 0.0,
+                "loss_efector_up": 0.0,
+                "loss_efector_anchor": 0.0,
+                "loss_efector_coh": 0.0,
+                "loss_efector_omega": 0.0,
+            }
+
         mem_var = slot_variance(out.memory)
         rel_var = slot_variance(out.relations)
         loss_structure = F.relu(args.min_slot_var - mem_var) + F.relu(args.min_slot_var - rel_var)
@@ -502,6 +621,7 @@ def train(args: argparse.Namespace) -> Dict:
             + args.lambda_structure * loss_structure
             + args.lambda_rev * loss_rev
             + args.lambda_self_observation * loss_internal_stream
+            + args.lambda_efector * loss_efector_stream
         )
         loss.backward()
 
@@ -529,7 +649,9 @@ def train(args: argparse.Namespace) -> Dict:
                 "loss_omega": float(loss_omega.detach().cpu()),
                 "loss_rev": float(loss_rev.detach().cpu()),
                 "loss_internal_stream": float(loss_internal_stream.detach().cpu()),
+                "loss_efector_stream": float(loss_efector_stream.detach().cpu()),
                 **internal_metrics,
+                **efector_metrics,
                 "speed": float(speed.detach().cpu()),
                 "info": float(info.detach().cpu()),
                 "omega": float(obs["omega"].mean().detach().cpu()),
@@ -548,7 +670,8 @@ def train(args: argparse.Namespace) -> Dict:
                 f"z={last['up_z']:.2e} m={last['up_memory']:.2e} r={last['up_relations']:.2e} "
                 f"c6={last['up_cubo']:.2e} xi={last['up_xi']:.2e} dxi={last['up_delta']:.2e} "
                 f"anchor={last['loss_anchor']:.3e} self={last['loss_internal_stream']:.3e} "
-                f"omega={last['omega']:.1e} coh={last['loss_coh']:.3e} "
+                f"efector={last['loss_efector_stream']:.3e} omega={last['omega']:.1e} "
+                f"coh={last['loss_coh']:.3e} "
                 f"rev={last['loss_rev']:.1e} time={elapsed:.1f}s",
                 flush=True,
             )
@@ -602,6 +725,8 @@ def main() -> None:
     p.add_argument("--lambda-rev", type=float, default=0.10)
     p.add_argument("--lambda-self-observation", type=float, default=0.25)
     p.add_argument("--self-observation-every", type=int, default=1)
+    p.add_argument("--lambda-efector", type=float, default=0.25)
+    p.add_argument("--efector-every", type=int, default=1)
     p.add_argument("--reversibility-loss-every", type=int, default=10)
     p.add_argument("--min-slot-var", type=float, default=1e-8)
 
