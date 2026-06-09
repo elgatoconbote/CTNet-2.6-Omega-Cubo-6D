@@ -3,6 +3,15 @@
 """
 CTNet 2.6 Omega Cubo 6D trainer with u=p coherence as the primary signal.
 
+Every observed stream is dataset. External text and CTNet's own internal
+processes enter through the same path:
+
+    observation -> OnlineSample -> batch_to_state -> contextual mass -> CTNet -> u=p
+
+There is no external observer module. CTNet observes while it runs, and what it
+observes becomes contextual mass through the same chart used by the external
+dataset.
+
 The surface training loop can look close to a standard online trainer: stream text,
 encode a fixed state, run CTNet, compute a loss, update weights.
 
@@ -271,6 +280,128 @@ def all_perspective_up_loss(
     return total, metrics
 
 
+
+def _scalar(x: torch.Tensor) -> float:
+    return float(x.detach().to(torch.float32).mean().cpu())
+
+
+def _tensor_reality_line(name: str, x: torch.Tensor) -> str:
+    y = x.detach().to(torch.float32)
+    return (
+        f"{name}.mean={float(y.mean().cpu()):.6e} "
+        f"{name}.rms={float(y.pow(2).mean().sqrt().cpu()):.6e} "
+        f"{name}.abs={float(y.abs().mean().cpu()):.6e}"
+    )
+
+
+def internal_reality_sample(
+    model: FoldedCTNetOmegaCubo26,
+    state: FoldedOmegaCuboState,
+    out: FoldedOmegaCuboState,
+    *,
+    step: int,
+    obs: Dict[str, torch.Tensor],
+    up_metrics: Dict[str, float],
+) -> OnlineSample:
+    """
+    CTNet observes its own running process exactly as it observes any dataset item.
+
+    This is not an external observer and not a diagnostic module. It serializes the
+    current internal transition as observed reality, then feeds it back through the
+    same OnlineSample -> batch_to_state -> contextual mass route used by external
+    text.
+
+    Everything observed is dataset.
+    Everything becomes contextual mass.
+    Everything is closed by u=p.
+    """
+    xi_in = model.pack(state)
+    xi_out = model.pack(out)
+    dxi = xi_out - xi_in
+
+    text = "\n".join(
+        [
+            "<reality_observation>",
+            "<source>ctnet_internal_process</source>",
+            "<principle>u=p</principle>",
+            "<meaning>question_or_input_deforms_state_response_is_coherent_closure</meaning>",
+            f"step={step}",
+            _tensor_reality_line("z_in", state.z),
+            _tensor_reality_line("z_out", out.z),
+            _tensor_reality_line("memory_in", state.memory),
+            _tensor_reality_line("memory_out", out.memory),
+            _tensor_reality_line("relations_in", state.relations),
+            _tensor_reality_line("relations_out", out.relations),
+            _tensor_reality_line("cubo_in", state.cubo),
+            _tensor_reality_line("cubo_out", out.cubo),
+            _tensor_reality_line("xi_in", xi_in),
+            _tensor_reality_line("xi_out", xi_out),
+            _tensor_reality_line("delta_xi", dxi),
+            f"omega={_scalar(obs['omega']):.6e}",
+            f"residual={_scalar(obs['residual']):.6e}",
+            f"absorption={_scalar(obs['absorption']):.6e}",
+            f"closure_score={_scalar(obs['closure_score']):.6e}",
+            " ".join(f"{k}={v:.6e}" for k, v in sorted(up_metrics.items())),
+            "</reality_observation>",
+        ]
+    )
+
+    return OnlineSample(
+        x=text,
+        y=text[1:] + " ",
+        source="ctnet://internal_process",
+        regime="ctnet_internal_reality",
+    )
+
+
+def observed_stream_loss(
+    model: FoldedCTNetOmegaCubo26,
+    sample: OnlineSample,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    max_bytes: int,
+    args: argparse.Namespace,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Trains an observed internal process through the same chart as the dataset.
+
+    observed process -> OnlineSample -> batch_to_state -> contextual mass -> CTNet -> u=p
+    """
+    obs_state, obs_target_z, _ = batch_to_state(
+        model,
+        [sample],
+        device=device,
+        dtype=dtype,
+        max_bytes=max_bytes,
+    )
+    obs_out = model.forward_state(obs_state)
+    obs_xi_out = model.pack(obs_out)
+
+    loss_obs_up, obs_up_metrics = all_perspective_up_loss(model, obs_state, obs_out)
+    loss_obs_anchor = F.mse_loss(obs_out.z, obs_target_z)
+    loss_obs_coh, _, _ = model.core.coherence_energy(obs_xi_out)
+    obs_cubo = model.cubo_observation(obs_out)
+    loss_obs_omega = obs_cubo["omega"].mean()
+
+    loss_obs_stream = (
+        loss_obs_up
+        + args.lambda_anchor * loss_obs_anchor
+        + args.lambda_coh * loss_obs_coh
+        + args.lambda_omega * loss_obs_omega
+    )
+
+    metrics = {
+        "loss_internal_stream": float(loss_obs_stream.detach().cpu()),
+        "loss_internal_up": float(loss_obs_up.detach().cpu()),
+        "loss_internal_anchor": float(loss_obs_anchor.detach().cpu()),
+        "loss_internal_coh": float(loss_obs_coh.detach().cpu()),
+        "loss_internal_omega": float(loss_obs_omega.detach().cpu()),
+        **{f"internal_{k}": v for k, v in obs_up_metrics.items()},
+    }
+    return loss_obs_stream, metrics
+
+
 def train(args: argparse.Namespace) -> Dict:
     device = torch.device("cuda" if args.cuda and torch.cuda.is_available() else "cpu")
     dtype = torch.float64 if args.fp64 else torch.float32
@@ -299,6 +430,7 @@ def train(args: argparse.Namespace) -> Dict:
 
     print("=== CTNet u=p multiscale coherence training ===", flush=True)
     print("objective=u=p at all exposed scales/perspectives + CT coherence tensor", flush=True)
+    print("self_observation=internal processes are fed through the same dataset chart", flush=True)
     print("loader=no datasets/no huggingface_hub/no pyarrow/no xet", flush=True)
     print(f"device={device} dtype={dtype} params={count_params(model)}", flush=True)
     print(f"layout capacity={layout.capacity} semantic_size={layout.semantic_size} pad_size={layout.pad_size}", flush=True)
@@ -324,6 +456,33 @@ def train(args: argparse.Namespace) -> Dict:
         loss_omega = obs["omega"].mean()
         loss_cubo_track = F.mse_loss(out.cubo, obs["vector"].detach())
 
+        if args.self_observation_every > 0 and step % args.self_observation_every == 0:
+            internal_sample = internal_reality_sample(
+                model,
+                state,
+                out,
+                step=step,
+                obs=obs,
+                up_metrics=up_metrics,
+            )
+            loss_internal_stream, internal_metrics = observed_stream_loss(
+                model,
+                internal_sample,
+                device=device,
+                dtype=dtype,
+                max_bytes=args.max_bytes,
+                args=args,
+            )
+        else:
+            loss_internal_stream = torch.zeros((), device=device, dtype=dtype)
+            internal_metrics = {
+                "loss_internal_stream": 0.0,
+                "loss_internal_up": 0.0,
+                "loss_internal_anchor": 0.0,
+                "loss_internal_coh": 0.0,
+                "loss_internal_omega": 0.0,
+            }
+
         mem_var = slot_variance(out.memory)
         rel_var = slot_variance(out.relations)
         loss_structure = F.relu(args.min_slot_var - mem_var) + F.relu(args.min_slot_var - rel_var)
@@ -342,6 +501,7 @@ def train(args: argparse.Namespace) -> Dict:
             + args.lambda_cubo * loss_cubo_track
             + args.lambda_structure * loss_structure
             + args.lambda_rev * loss_rev
+            + args.lambda_self_observation * loss_internal_stream
         )
         loss.backward()
 
@@ -368,6 +528,8 @@ def train(args: argparse.Namespace) -> Dict:
                 "loss_coh": float(loss_coh.detach().cpu()),
                 "loss_omega": float(loss_omega.detach().cpu()),
                 "loss_rev": float(loss_rev.detach().cpu()),
+                "loss_internal_stream": float(loss_internal_stream.detach().cpu()),
+                **internal_metrics,
                 "speed": float(speed.detach().cpu()),
                 "info": float(info.detach().cpu()),
                 "omega": float(obs["omega"].mean().detach().cpu()),
@@ -385,8 +547,9 @@ def train(args: argparse.Namespace) -> Dict:
                 f"step {step:6d} | loss={last['loss']:.6e} up={last['loss_up']:.3e} "
                 f"z={last['up_z']:.2e} m={last['up_memory']:.2e} r={last['up_relations']:.2e} "
                 f"c6={last['up_cubo']:.2e} xi={last['up_xi']:.2e} dxi={last['up_delta']:.2e} "
-                f"anchor={last['loss_anchor']:.3e} omega={last['omega']:.1e} "
-                f"coh={last['loss_coh']:.3e} rev={last['loss_rev']:.1e} time={elapsed:.1f}s",
+                f"anchor={last['loss_anchor']:.3e} self={last['loss_internal_stream']:.3e} "
+                f"omega={last['omega']:.1e} coh={last['loss_coh']:.3e} "
+                f"rev={last['loss_rev']:.1e} time={elapsed:.1f}s",
                 flush=True,
             )
 
@@ -437,6 +600,8 @@ def main() -> None:
     p.add_argument("--lambda-cubo", type=float, default=0.05)
     p.add_argument("--lambda-structure", type=float, default=0.10)
     p.add_argument("--lambda-rev", type=float, default=0.10)
+    p.add_argument("--lambda-self-observation", type=float, default=0.25)
+    p.add_argument("--self-observation-every", type=int, default=1)
     p.add_argument("--reversibility-loss-every", type=int, default=10)
     p.add_argument("--min-slot-var", type=float, default=1e-8)
 
