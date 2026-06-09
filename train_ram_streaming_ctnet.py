@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-No-disk launcher for CTNet online streaming.
+RAM-limited launcher for CTNet online streaming.
 
-This file sets every Hugging Face / datasets / torch / temp cache to RAM before
-importing the training module. It also disables checkpoint writing by default.
+This file sets Hugging Face / datasets / torch / temp cache paths to tmpfs
+before importing the training module. It prevents persistent disk cache while
+leaving CTNet tensors on GPU when --cuda is used.
 
 Important distinction:
 - CTNet state and memory remain fixed-size during training.
-- External libraries may cache network metadata/chunks unless forced into RAM.
+- External libraries may cache network metadata/chunks unless forced into tmpfs.
 
 Usage:
-    /path/to/venv/bin/python train_ram_streaming_ctnet.py --steps 1000 --batch 2 --cuda
+    /path/to/venv/bin/python train_ram_streaming_ctnet.py --steps 1000 --batch 1 --cuda --save-every 0
 
 Default output goes to /dev/shm/ctnet_ram_stream, which is tmpfs/RAM on Linux.
+The trainer version currently always writes a final checkpoint; with this
+launcher that checkpoint is written to /dev/shm, not to persistent disk.
 """
 
 from __future__ import annotations
@@ -47,16 +50,20 @@ def main() -> None:
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
     os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BARS", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+    os.environ.setdefault("PYTHONMALLOC", "malloc")
 
     argv = ["train_streaming_ctnet.py"] + sys.argv[1:]
     if "--out-dir" not in argv:
         argv += ["--out-dir", str(ram_root / "runs")]
     if "--save-every" not in argv:
         argv += ["--save-every", "0"]
-    if "--no-final-save" not in argv:
-        argv += ["--no-final-save"]
 
-    print("CTNet no-disk/RAM streaming launcher")
+    print("CTNet RAM-limited streaming launcher")
     print("RAM root:", ram_root)
     print("Python:", sys.executable)
     print("HF_HOME:", os.environ["HF_HOME"])
