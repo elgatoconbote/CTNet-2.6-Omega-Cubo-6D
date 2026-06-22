@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CTNet runtime loop v0.6.
+CTNet runtime loop v0.7.
 
 Ciclo operativo persistente para CTNet-Omega-Cubo6D + MTHD:
 observacion -> pliegue -> medicion -> simulacion de ciclo completo -> accion
@@ -17,15 +17,19 @@ v0.3 introdujo dos reguladores necesarios:
   pliegue de accion antes de reobservar.
 
 v0.4 fija el principio arquitectonico central: la deuda que gobierna accion,
-simulacion e inhibicion nace del tensor de coherencia + cierre u/p. Las señales
-del Cubo6D quedan como diagnostico, no como ley de decision primaria.
+simulacion e inhibicion nace del tensor de coherencia + cierre u/p.
+
+v0.7 integra Cubo6D dentro de la ley efectiva de cierre:
+closure_debt = coherence_debt + up_debt + cubo6d_debt.
+Cubo6D deja de ser solo diagnostico: residual, omega, no-cierre y falta de
+absorcion contribuyen a la deuda que gobierna accion.
 
 v0.4.1 resuelve de forma robusta el nucleo fractal real: en algunos layouts esta
 en base.core, y en otros en base.core.core.
 
 v0.5 introduce consolidate_u_p: un efector interno que convierte la trayectoria
 reciente de cierre en una regla MTHD corta. La regla solo gana si su simulacion
-reduce closure_debt = coherence_debt + up_debt; si no, gana inhibit.
+reduce closure_debt; si no, gana inhibit.
 """
 from __future__ import annotations
 
@@ -110,7 +114,7 @@ class Observador:
 class Probe:
     tick: int
 
-    # Ley de gobierno v0.4+: tensor de coherencia + cierre u/p.
+    # Ley de gobierno v0.7+: tensor de coherencia + cierre u/p + Cubo6D.
     debt: float
     closure_debt: float
     coherence_debt: float
@@ -122,7 +126,7 @@ class Probe:
     speed: float
     info_energy: float
 
-    # Diagnostico Cubo6D: no manda la decision primaria.
+    # Cubo6D estructural: participa en la deuda de cierre.
     omega: float
     closure_score: float
     absorption: float
@@ -132,6 +136,11 @@ class Probe:
     memory_digest: str
     relations_digest: str
     cubo_digest: str
+    cubo6d_debt: float = 0.0
+    cubo6d_residual_debt: float = 0.0
+    cubo6d_omega_debt: float = 0.0
+    cubo6d_nonclosure_debt: float = 0.0
+    cubo6d_absorption_debt: float = 0.0
     ts: float = field(default_factory=time.time)
 
     def record(self) -> Dict[str, Any]:
@@ -295,10 +304,25 @@ class CTNetRuntimeLoop:
                 raise RuntimeError("state is not initialized")
             state = self.state
 
-        # Diagnostico geometrico Cubo6D.
+        # Cubo6D estructural.
         obs = self.model.base.cubo_observation(state)
+        omega = mean_float(obs["omega"])
+        closure_score = mean_float(obs["closure_score"])
+        absorption = mean_float(obs["absorption"])
+        residual = mean_float(obs["residual"])
 
-        # Ley de gobierno: tensor de coherencia + u/p sobre Xi.
+        cubo6d_residual_debt = log_debt(abs(residual))
+        cubo6d_omega_debt = log_debt(abs(omega))
+        cubo6d_nonclosure_debt = log_debt(max(0.0, 1.0 - closure_score))
+        cubo6d_absorption_debt = log_debt(max(0.0, 1.0 - absorption))
+        cubo6d_debt = (
+            cubo6d_residual_debt
+            + cubo6d_omega_debt
+            + cubo6d_nonclosure_debt
+            + cubo6d_absorption_debt
+        )
+
+        # Ley de gobierno: tensor de coherencia + u/p + Cubo6D sobre Xi.
         xi = self.model.pack(state)
         core = self.fractal_core()
         coh, speed, info_energy = core.coherence_energy(xi)
@@ -308,7 +332,7 @@ class CTNetRuntimeLoop:
         up_error = up["up_error"]
         coherence_debt = log_debt(coherence)
         up_debt = log_debt(up_error)
-        closure_debt = coherence_debt + up_debt
+        closure_debt = coherence_debt + up_debt + cubo6d_debt
 
         return Probe(
             tick=self.tick,
@@ -316,16 +340,21 @@ class CTNetRuntimeLoop:
             closure_debt=float(closure_debt),
             coherence_debt=float(coherence_debt),
             up_debt=float(up_debt),
+            cubo6d_debt=float(cubo6d_debt),
+            cubo6d_residual_debt=float(cubo6d_residual_debt),
+            cubo6d_omega_debt=float(cubo6d_omega_debt),
+            cubo6d_nonclosure_debt=float(cubo6d_nonclosure_debt),
+            cubo6d_absorption_debt=float(cubo6d_absorption_debt),
             coherence=float(coherence),
             up_error=float(up_error),
             up_forward_mse=float(up["up_forward_mse"]),
             up_inverse_mse=float(up["up_inverse_mse"]),
             speed=safe_float(speed.detach().mean().cpu()),
             info_energy=safe_float(info_energy.detach().cpu()),
-            omega=mean_float(obs["omega"]),
-            closure_score=mean_float(obs["closure_score"]),
-            absorption=mean_float(obs["absorption"]),
-            residual=mean_float(obs["residual"]),
+            omega=float(omega),
+            closure_score=float(closure_score),
+            absorption=float(absorption),
+            residual=float(residual),
             z_digest=tensor_digest(state.z),
             memory_digest=tensor_digest(state.memory),
             relations_digest=tensor_digest(state.relations),
@@ -338,6 +367,11 @@ class CTNetRuntimeLoop:
             "closure_debt": probe.closure_debt,
             "coherence_debt": probe.coherence_debt,
             "up_debt": probe.up_debt,
+            "cubo6d_debt": getattr(probe, "cubo6d_debt", 0.0),
+            "cubo6d_residual_debt": getattr(probe, "cubo6d_residual_debt", 0.0),
+            "cubo6d_omega_debt": getattr(probe, "cubo6d_omega_debt", 0.0),
+            "cubo6d_nonclosure_debt": getattr(probe, "cubo6d_nonclosure_debt", 0.0),
+            "cubo6d_absorption_debt": getattr(probe, "cubo6d_absorption_debt", 0.0),
             "coherence": probe.coherence,
             "up_error": probe.up_error,
             "up_forward_mse": probe.up_forward_mse,
@@ -387,7 +421,7 @@ class CTNetRuntimeLoop:
 
         summary = {
             "schema": "ctnet.consolidate_u_p.v2",
-            "governance": "coherence_tensor_plus_u_p",
+            "governance": "coherence_tensor_plus_u_p_plus_cubo6d",
             "tick": self.tick,
             "observation_digest": digest_obj(observation.record(), 24),
             "baseline": self.compact_probe(probe),
@@ -521,7 +555,7 @@ class CTNetRuntimeLoop:
             "variant_policy": "directed signed MTHD fold; accept only if closure_debt decreases",
         }
         return [
-            Action("text", f"closure_debt={probe.closure_debt:.6f} coh={probe.coherence:.6g} up={probe.up_error:.6g} obs={text}", "externalizar cierre desde tensor de coherencia + u/p"),
+            Action("text", f"closure_debt={probe.closure_debt:.6f} coh={probe.coherence:.6g} up={probe.up_error:.6g} cubo6d={getattr(probe, 'cubo6d_debt', 0.0):.6g} obs={text}", "externalizar cierre desde tensor de coherencia + u/p + Cubo6D"),
             Action("memory", f"guardar continuidad obs_hash={digest_obj(observation.record(), 24)} closure_debt={probe.closure_debt:.6f}", "reforzar autobiografia si mejora cierre u/p"),
             Action("self_probe", canonical_json({"closure_debt": probe.closure_debt, "coherence": probe.coherence, "up_error": probe.up_error, "up_forward_mse": probe.up_forward_mse, "up_inverse_mse": probe.up_inverse_mse})[: self.cfg.text_max], "observar tensor de coherencia y cierre u/p"),
             Action("consolidate_u_p", canonical_json(consolidation_payload), "plegar regla MTHD corta si reduce closure_debt"),
@@ -630,7 +664,9 @@ class CTNetRuntimeLoop:
             "final_probe": probe1.record(),
             "delta_debt": final_delta,
             "closed_debt": final_delta <= 0.0,
-            "governance": "coherence_tensor_plus_u_p",
+            "governance": "coherence_tensor_plus_u_p_plus_cubo6d",
+            "closure_law": "closure_debt = coherence_debt + up_debt + cubo6d_debt",
+            "cubo6d_required": True,
             "consolidation_window": int(self.cfg.consolidation_window),
         }
         self.records.append(event)
@@ -648,7 +684,7 @@ class CTNetRuntimeLoop:
             "tick": self.tick,
             "atlas_shape": list(self.model.atlas.shape),
             "records_loaded": len(self.records),
-            "governance": "coherence_tensor_plus_u_p",
+            "governance": "coherence_tensor_plus_u_p_plus_cubo6d",
             "probe": probe.record(),
             "recent_closure_trace": self.recent_closure_trace(self.cfg.consolidation_window),
             "paths": {"state": str(self.state_path), "atlas": str(self.atlas_path), "log": str(self.log_path)},
