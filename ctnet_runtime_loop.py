@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CTNet runtime loop v0.5.
+CTNet runtime loop v0.6.
 
 Ciclo operativo persistente para CTNet-Omega-Cubo6D + MTHD:
 observacion -> pliegue -> medicion -> simulacion de ciclo completo -> accion
@@ -37,13 +37,15 @@ import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 
 from ctnet_infinite_atlas_mthd import InfiniteAtlasMTHD, receipt_to_json
 from ctnet_omega_cubo6d_plegado_ctnet26 import FoldedOmegaCuboState
 from ctnet_omega_mthd_integrated import CTNetOmegaMTHD26
+
+EPS = 1.0e-12
 
 
 def canonical_json(obj: Any) -> str:
@@ -384,17 +386,46 @@ class CTNetRuntimeLoop:
                 slot["min_delta"] = 0.0
 
         summary = {
-            "schema": "ctnet.consolidate_u_p.v1",
+            "schema": "ctnet.consolidate_u_p.v2",
             "governance": "coherence_tensor_plus_u_p",
             "tick": self.tick,
             "observation_digest": digest_obj(observation.record(), 24),
             "baseline": self.compact_probe(probe),
             "trace": trace,
             "by_action": by_action,
-            "acceptance": "fold only if simulated closure_debt decreases relative to baseline; otherwise inhibit",
+            "acceptance": "try directed signed MTHD fold variants; fold only if simulated closure_debt decreases relative to baseline; otherwise inhibit",
         }
         text = canonical_json(summary)
         return {"kind": "repeat", "text": text[:4096], "n": 1}
+
+
+    def directed_consolidation_variants(self) -> List[Dict[str, Any]]:
+        closure_steps = max(1, int(self.cfg.closure_steps))
+        stabilizer_steps = max(1, int(self.cfg.stabilizer_steps))
+        return [
+            {"sign": +1.0, "settle": "forward", "steps": closure_steps},
+            {"sign": -1.0, "settle": "forward", "steps": closure_steps},
+            {"sign": +1.0, "settle": "inverse", "steps": stabilizer_steps},
+            {"sign": -1.0, "settle": "inverse", "steps": stabilizer_steps},
+            {"sign": +1.0, "settle": "none", "steps": 0},
+            {"sign": -1.0, "settle": "none", "steps": 0},
+        ]
+
+    @torch.no_grad()
+    def settle_state(self, state: FoldedOmegaCuboState, mode: str, steps: int) -> FoldedOmegaCuboState:
+        out = state
+        if mode == "none":
+            return out
+        if mode == "forward":
+            for _ in range(max(1, int(steps))):
+                out = self.model.forward_state(out)
+            return out
+        if mode == "inverse":
+            for _ in range(max(1, int(steps))):
+                out = self.model.inverse_state(out)
+            return out
+        raise ValueError(f"unknown settle mode: {mode}")
+
 
     @torch.no_grad()
     def fold_record(self, phase: str, record: Dict[str, Any]) -> Dict[str, Any]:
@@ -417,35 +448,68 @@ class CTNetRuntimeLoop:
         return sim_state
 
     @torch.no_grad()
-    def simulate_consolidation(self, state: FoldedOmegaCuboState, action: Action) -> FoldedOmegaCuboState:
+    def select_consolidation_variant(self, state: FoldedOmegaCuboState, action: Action) -> Tuple[FoldedOmegaCuboState, Dict[str, Any], Probe]:
         payload = json.loads(action.payload)
         key = f"sim/{self.tick:012d}/consolidate_u_p/{payload['rule_digest']}"
         receipt = self.model.atlas.fold_rule(key, payload["rule"], fold=False)
-        sim_state = self.model.fold_receipt_state(state, receipt, sign=+1.0)
-        for _ in range(max(1, int(self.cfg.closure_steps))):
-            sim_state = self.model.forward_state(sim_state)
-        return sim_state
+        best_state = None
+        best_variant = None
+        best_probe = None
+
+        for variant in self.directed_consolidation_variants():
+            sim_state = self.model.fold_receipt_state(clone_state(state), receipt, sign=safe_float(variant["sign"]))
+            sim_state = self.settle_state(sim_state, str(variant["settle"]), int(variant["steps"]))
+            probe = self.probe(sim_state)
+            candidate = dict(variant)
+            candidate["closure_debt"] = probe.closure_debt
+            candidate["coherence_debt"] = probe.coherence_debt
+            candidate["up_debt"] = probe.up_debt
+            if best_probe is None or probe.closure_debt < best_probe.closure_debt:
+                best_state = sim_state
+                best_probe = probe
+                best_variant = candidate
+
+        if best_state is None or best_probe is None or best_variant is None:
+            raise RuntimeError("consolidation variant search produced no candidates")
+
+        payload["selected"] = best_variant
+        action.payload = canonical_json(payload)
+        return best_state, best_variant, best_probe
 
     @torch.no_grad()
     def fold_consolidation(self, action: Action) -> Dict[str, Any]:
         if self.state is None:
             raise RuntimeError("state is not initialized")
         payload = json.loads(action.payload)
+        selected = payload.get("selected") or {
+            "sign": +1.0,
+            "settle": "forward",
+            "steps": max(1, int(self.cfg.closure_steps)),
+        }
         key = f"runtime/{self.tick:012d}/consolidate_u_p/{payload['rule_digest']}"
         receipt = self.model.atlas.fold_rule(key, payload["rule"], fold=True)
-        self.state = self.model.fold_receipt_state(self.state, receipt, sign=+1.0)
-        for _ in range(max(1, int(self.cfg.closure_steps))):
-            self.state = self.model.forward_state(self.state)
-        return {"key": key, "receipt": receipt_to_json(receipt), "rule_digest": payload["rule_digest"]}
+        self.state = self.model.fold_receipt_state(
+            self.state,
+            receipt,
+            sign=safe_float(selected.get("sign", +1.0)),
+        )
+        self.state = self.settle_state(
+            self.state,
+            str(selected.get("settle", "forward")),
+            int(selected.get("steps", max(1, int(self.cfg.closure_steps)))),
+        )
+        return {
+            "key": key,
+            "receipt": receipt_to_json(receipt),
+            "rule_digest": payload["rule_digest"],
+            "selected": selected,
+        }
 
     @torch.no_grad()
     def apply_internal_effect(self, state: FoldedOmegaCuboState, action: Action) -> FoldedOmegaCuboState:
         if action.kind != "stabilize":
             return state
-        out = state
-        for _ in range(max(1, int(self.cfg.stabilizer_steps))):
-            out = self.model.inverse_state(out)
-        return out
+        return self.settle_state(state, "inverse", self.cfg.stabilizer_steps)
 
     def propose(self, observation: Observador, probe: Probe) -> List[Action]:
         text = observation.x.strip().replace("\n", " ")[: self.cfg.text_max]
@@ -454,6 +518,7 @@ class CTNetRuntimeLoop:
             "rule_digest": digest_obj(consolidation_rule, 24),
             "rule": consolidation_rule,
             "window": int(self.cfg.consolidation_window),
+            "variant_policy": "directed signed MTHD fold; accept only if closure_debt decreases",
         }
         return [
             Action("text", f"closure_debt={probe.closure_debt:.6f} coh={probe.coherence:.6g} up={probe.up_error:.6g} obs={text}", "externalizar cierre desde tensor de coherencia + u/p"),
@@ -473,7 +538,8 @@ class CTNetRuntimeLoop:
             return "self_probe:" + action.payload
         if action.kind == "consolidate_u_p":
             payload = json.loads(action.payload)
-            return "internal_consolidated_u_p:" + payload["rule_digest"]
+            selected = payload.get("selected", {})
+            return "internal_consolidated_u_p:" + payload["rule_digest"] + ":" + canonical_json(selected)
         if action.kind == "stabilize":
             return "internal_stabilized:" + action.payload
         if action.kind == "inhibit":
@@ -491,11 +557,14 @@ class CTNetRuntimeLoop:
             action.simulated_probe = probe.record()
             return action
         if action.kind == "consolidate_u_p":
-            sim_state = self.simulate_consolidation(clone_state(self.state), action)
-            sim_probe = self.probe(sim_state)
+            _, selected, sim_probe = self.select_consolidation_variant(clone_state(self.state), action)
             action.simulated_debt = sim_probe.debt
             action.simulated_delta = sim_probe.debt - baseline_debt
             action.simulated_probe = sim_probe.record()
+            selected["simulated_delta"] = action.simulated_delta
+            payload = json.loads(action.payload)
+            payload["selected"] = selected
+            action.payload = canonical_json(payload)
             return action
         sim_state = clone_state(self.state)
         sim_state = self.simulate_fold_record(sim_state, "action", {"tick": self.tick, "phase": "action", "action": action.record()})
@@ -511,8 +580,16 @@ class CTNetRuntimeLoop:
 
     def choose(self, actions: Iterable[Action], baseline_debt: float) -> Action:
         sims = [self.simulate_full_cycle(a, baseline_debt) for a in actions]
-        # La eleccion se ordena por delta de closure_debt, que en v0.5 es CoherenceTensor + u/p.
-        sims.sort(key=lambda a: (a.simulated_delta, a.simulated_debt, 1 if a.kind == "inhibit" else 0))
+        improvers = [a for a in sims if a.kind != "inhibit" and a.simulated_delta < -EPS]
+        if improvers:
+            improvers.sort(key=lambda a: (a.simulated_delta, a.simulated_debt))
+            return improvers[0]
+
+        inhibitors = [a for a in sims if a.kind == "inhibit"]
+        if inhibitors:
+            return inhibitors[0]
+
+        sims.sort(key=lambda a: (a.simulated_delta, a.simulated_debt))
         return sims[0]
 
     @torch.no_grad()
