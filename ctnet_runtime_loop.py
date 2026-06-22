@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CTNet runtime loop v0.3.
+CTNet runtime loop v0.4.
 
 Ciclo operativo persistente para CTNet-Omega-Cubo6D + MTHD:
 observacion -> pliegue -> medicion -> simulacion de ciclo completo -> accion
@@ -10,11 +10,15 @@ observacion -> pliegue -> medicion -> simulacion de ciclo completo -> accion
 v0.2 corrigio la seleccion de acciones: cada candidato se simula hasta su
 reobservacion, y no solo como pliegue aislado.
 
-v0.3 introduce dos reguladores necesarios:
+v0.3 introdujo dos reguladores necesarios:
 - inhibit: accion nula real. No escribe accion ni reobservacion cuando todos los
   candidatos abren deuda.
 - stabilize: accion interna reversible que aplica pasos inversos CTNet tras el
   pliegue de accion antes de reobservar.
+
+v0.4 fija el principio arquitectonico central: la deuda que gobierna accion,
+simulacion e inhibicion nace del tensor de coherencia + cierre u/p. Las señales
+del Cubo6D quedan como diagnostico, no como ley de decision primaria.
 """
 from __future__ import annotations
 
@@ -66,6 +70,10 @@ def safe_float(x: Any) -> float:
         return 0.0
 
 
+def log_debt(x: float, scale: float = 10.0) -> float:
+    return math.log1p(max(0.0, safe_float(x))) / scale
+
+
 def clone_state(state: FoldedOmegaCuboState) -> FoldedOmegaCuboState:
     return FoldedOmegaCuboState(
         z=state.z.detach().clone(),
@@ -92,14 +100,25 @@ class Observador:
 @dataclass
 class Probe:
     tick: int
+
+    # Ley de gobierno v0.4: tensor de coherencia + cierre u/p.
     debt: float
+    closure_debt: float
+    coherence_debt: float
+    up_debt: float
+    coherence: float
+    up_error: float
+    up_forward_mse: float
+    up_inverse_mse: float
+    speed: float
+    info_energy: float
+
+    # Diagnostico Cubo6D: no manda la decision primaria.
     omega: float
     closure_score: float
     absorption: float
     residual: float
-    coherence: float
-    speed: float
-    info_energy: float
+
     z_digest: str
     memory_digest: str
     relations_digest: str
@@ -233,28 +252,59 @@ class CTNetRuntimeLoop:
             f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
     @torch.no_grad()
+    def up_metrics(self, xi: torch.Tensor) -> Dict[str, float]:
+        """Mide el cierre u/p explicito: u debe reconstruirse desde p y p desde u."""
+        core = self.model.base.core
+        d2 = int(core.d) // 2
+        u, p = xi[..., :d2], xi[..., d2:]
+        u_hat = core.latent(p)
+        p_hat = core.latent.inverse(u)
+        up_forward_mse = mean_float((u - u_hat).pow(2))
+        up_inverse_mse = mean_float((p - p_hat).pow(2))
+        up_error = up_forward_mse + up_inverse_mse
+        return {
+            "up_error": float(up_error),
+            "up_forward_mse": float(up_forward_mse),
+            "up_inverse_mse": float(up_inverse_mse),
+        }
+
+    @torch.no_grad()
     def probe(self, state: Optional[FoldedOmegaCuboState] = None) -> Probe:
         if state is None:
             if self.state is None:
                 raise RuntimeError("state is not initialized")
             state = self.state
+
+        # Diagnostico geometrico Cubo6D.
         obs = self.model.base.cubo_observation(state)
+
+        # Ley de gobierno: tensor de coherencia + u/p sobre Xi.
         xi = self.model.pack(state)
         coh, speed, info_energy = self.model.base.core.coherence_energy(xi)
-        omega = mean_float(obs["omega"])
-        closure_score = mean_float(obs["closure_score"])
+        up = self.up_metrics(xi)
+
         coherence = safe_float(coh.detach().cpu())
-        debt = max(0.0, omega) + max(0.0, 1.0 - closure_score) + math.log1p(max(0.0, coherence)) / 10.0
+        up_error = up["up_error"]
+        coherence_debt = log_debt(coherence)
+        up_debt = log_debt(up_error)
+        closure_debt = coherence_debt + up_debt
+
         return Probe(
             tick=self.tick,
-            debt=debt,
-            omega=omega,
-            closure_score=closure_score,
-            absorption=mean_float(obs["absorption"]),
-            residual=mean_float(obs["residual"]),
-            coherence=coherence,
+            debt=float(closure_debt),
+            closure_debt=float(closure_debt),
+            coherence_debt=float(coherence_debt),
+            up_debt=float(up_debt),
+            coherence=float(coherence),
+            up_error=float(up_error),
+            up_forward_mse=float(up["up_forward_mse"]),
+            up_inverse_mse=float(up["up_inverse_mse"]),
             speed=safe_float(speed.detach().mean().cpu()),
             info_energy=safe_float(info_energy.detach().cpu()),
+            omega=mean_float(obs["omega"]),
+            closure_score=mean_float(obs["closure_score"]),
+            absorption=mean_float(obs["absorption"]),
+            residual=mean_float(obs["residual"]),
             z_digest=tensor_digest(state.z),
             memory_digest=tensor_digest(state.memory),
             relations_digest=tensor_digest(state.relations),
@@ -293,11 +343,11 @@ class CTNetRuntimeLoop:
     def propose(self, observation: Observador, probe: Probe) -> List[Action]:
         text = observation.x.strip().replace("\n", " ")[: self.cfg.text_max]
         return [
-            Action("text", f"debt={probe.debt:.6f} omega={probe.omega:.6f} closure={probe.closure_score:.6f} obs={text}", "externalizar cierre"),
-            Action("memory", f"guardar continuidad obs_hash={digest_obj(observation.record(), 24)} debt={probe.debt:.6f}", "reforzar autobiografia"),
-            Action("self_probe", canonical_json(probe.record())[: self.cfg.text_max], "observar estado interno"),
-            Action("stabilize", f"aplicar {max(1, int(self.cfg.stabilizer_steps))} paso(s) inverso(s) CTNet antes de reobservacion", "regular deriva interna reversible"),
-            Action("inhibit", "sin accion ni reobservacion", "preservar estabilidad cuando toda accion abre deuda"),
+            Action("text", f"closure_debt={probe.closure_debt:.6f} coh={probe.coherence:.6g} up={probe.up_error:.6g} obs={text}", "externalizar cierre desde tensor de coherencia + u/p"),
+            Action("memory", f"guardar continuidad obs_hash={digest_obj(observation.record(), 24)} closure_debt={probe.closure_debt:.6f}", "reforzar autobiografia si mejora cierre u/p"),
+            Action("self_probe", canonical_json({"closure_debt": probe.closure_debt, "coherence": probe.coherence, "up_error": probe.up_error, "up_forward_mse": probe.up_forward_mse, "up_inverse_mse": probe.up_inverse_mse})[: self.cfg.text_max], "observar tensor de coherencia y cierre u/p"),
+            Action("stabilize", f"aplicar {max(1, int(self.cfg.stabilizer_steps))} paso(s) inverso(s) CTNet antes de reobservacion", "regular deriva interna reversible medida por coherencia + u/p"),
+            Action("inhibit", "sin accion ni reobservacion", "preservar cierre u/p cuando toda accion abre deuda"),
         ]
 
     def visible_from_action(self, action: Action) -> str:
@@ -337,7 +387,7 @@ class CTNetRuntimeLoop:
 
     def choose(self, actions: Iterable[Action], baseline_debt: float) -> Action:
         sims = [self.simulate_full_cycle(a, baseline_debt) for a in actions]
-        # Si ninguna accion cierra deuda, inhibit debe ganar con delta ~= 0.
+        # La eleccion se ordena por delta de closure_debt, que en v0.4 es CoherenceTensor + u/p.
         sims.sort(key=lambda a: (a.simulated_delta, a.simulated_debt, 1 if a.kind == "inhibit" else 0))
         return sims[0]
 
@@ -377,6 +427,7 @@ class CTNetRuntimeLoop:
             "final_probe": probe1.record(),
             "delta_debt": final_delta,
             "closed_debt": final_delta <= 0.0,
+            "governance": "coherence_tensor_plus_u_p",
         }
         self.records.append(event)
         self.records = self.records[-self.cfg.max_records :]
@@ -387,12 +438,14 @@ class CTNetRuntimeLoop:
     def status(self) -> Dict[str, Any]:
         if self.state is None:
             self.init_or_load()
+        probe = self.probe()
         return {
             "root": str(self.root),
             "tick": self.tick,
             "atlas_shape": list(self.model.atlas.shape),
             "records_loaded": len(self.records),
-            "probe": self.probe().record(),
+            "governance": "coherence_tensor_plus_u_p",
+            "probe": probe.record(),
             "paths": {"state": str(self.state_path), "atlas": str(self.atlas_path), "log": str(self.log_path)},
         }
 
