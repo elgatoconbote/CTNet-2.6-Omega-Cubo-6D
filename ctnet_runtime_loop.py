@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+CTNet runtime loop v0.1.
+
+Ciclo operativo persistente para CTNet-Omega-Cubo6D + MTHD:
+observacion -> pliegue -> medicion -> simulacion -> accion -> reobservacion -> memoria.
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import hashlib
+import json
+import math
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import torch
+
+from ctnet_infinite_atlas_mthd import InfiniteAtlasMTHD, receipt_to_json
+from ctnet_omega_cubo6d_plegado_ctnet26 import FoldedOmegaCuboState
+from ctnet_omega_mthd_integrated import CTNetOmegaMTHD26
+
+
+def canonical_json(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def json_bytes(obj: Any) -> bytes:
+    return canonical_json(obj).encode("utf-8")
+
+
+def digest_obj(obj: Any, n: int = 16) -> str:
+    return hashlib.sha256(json_bytes(obj)).hexdigest()[:n]
+
+
+def tensor_digest(x: torch.Tensor, n: int = 16) -> str:
+    cpu = x.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    return hashlib.sha256(cpu.numpy().tobytes()).hexdigest()[:n]
+
+
+def mean_float(x: torch.Tensor) -> float:
+    return float(torch.nan_to_num(x.detach()).mean().cpu())
+
+
+def safe_float(x: Any) -> float:
+    try:
+        y = float(x)
+        if math.isnan(y) or math.isinf(y):
+            return 0.0
+        return y
+    except Exception:
+        return 0.0
+
+
+@dataclass
+class Observador:
+    x: str
+    y: str = ""
+    source: str = "external"
+    regime: str = "observation"
+    ts: float = field(default_factory=time.time)
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+    def record(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self)
+
+
+@dataclass
+class Probe:
+    tick: int
+    debt: float
+    omega: float
+    closure_score: float
+    absorption: float
+    residual: float
+    coherence: float
+    speed: float
+    info_energy: float
+    z_digest: str
+    memory_digest: str
+    relations_digest: str
+    cubo_digest: str
+    ts: float = field(default_factory=time.time)
+
+    def record(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self)
+
+
+@dataclass
+class Action:
+    kind: str
+    payload: str
+    reason: str
+    simulated_debt: float = 0.0
+    simulated_probe: Optional[Dict[str, Any]] = None
+
+    def record(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self)
+
+
+@dataclass
+class RuntimeConfig:
+    root: str = ".ctnet_runtime"
+    seed: int = 0
+    dtype: str = "float32"
+    device: str = "cpu"
+    mthd_seed: str = "ctnet-runtime"
+    mthd_omega_words: int = 256
+    closure_steps: int = 1
+    consolidation_every: int = 16
+    max_records: int = 2048
+    text_max: int = 480
+
+    def torch_dtype(self) -> torch.dtype:
+        return torch.float64 if self.dtype == "float64" else torch.float32
+
+    def torch_device(self) -> torch.device:
+        if self.device == "cuda" and torch.cuda.is_available():
+            return torch.device("cuda")
+        return torch.device("cpu")
+
+
+class CTNetRuntimeLoop:
+    def __init__(self, cfg: RuntimeConfig):
+        self.cfg = cfg
+        self.root = Path(cfg.root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.device = cfg.torch_device()
+        self.dtype = cfg.torch_dtype()
+        torch.manual_seed(int(cfg.seed))
+        self.model = CTNetOmegaMTHD26(mthd_seed=cfg.mthd_seed, mthd_omega_words=cfg.mthd_omega_words).to(device=self.device, dtype=self.dtype)
+        self.model.eval()
+        self.tick = 0
+        self.state: Optional[FoldedOmegaCuboState] = None
+        self.records: List[Dict[str, Any]] = []
+
+    @property
+    def state_path(self) -> Path:
+        return self.root / "omega_state.pt"
+
+    @property
+    def atlas_path(self) -> Path:
+        return self.root / "mthd_atlas.json"
+
+    @property
+    def log_path(self) -> Path:
+        return self.root / "runtime.jsonl"
+
+    @property
+    def config_path(self) -> Path:
+        return self.root / "runtime_config.json"
+
+    def init_or_load(self) -> None:
+        self.config_path.write_text(json.dumps(dataclasses.asdict(self.cfg), indent=2, ensure_ascii=False), encoding="utf-8")
+        if self.state_path.exists() and self.atlas_path.exists():
+            self.load()
+        else:
+            self.state = self.model.random_state(batch=1, device=self.device, dtype=self.dtype, seed=self.cfg.seed)
+            self.save()
+
+    def save(self) -> None:
+        if self.state is None:
+            raise RuntimeError("state is not initialized")
+        torch.save(
+            {
+                "tick": self.tick,
+                "state": {
+                    "z": self.state.z.detach().cpu(),
+                    "memory": self.state.memory.detach().cpu(),
+                    "relations": self.state.relations.detach().cpu(),
+                    "cubo": self.state.cubo.detach().cpu(),
+                    "pad": self.state.pad.detach().cpu(),
+                },
+            },
+            self.state_path,
+        )
+        self.model.atlas.save(self.atlas_path)
+
+    def load(self) -> None:
+        payload = torch.load(self.state_path, map_location=self.device)
+        st = payload["state"]
+        self.tick = int(payload.get("tick", 0))
+        self.state = FoldedOmegaCuboState(
+            z=st["z"].to(device=self.device, dtype=self.dtype),
+            memory=st["memory"].to(device=self.device, dtype=self.dtype),
+            relations=st["relations"].to(device=self.device, dtype=self.dtype),
+            cubo=st["cubo"].to(device=self.device, dtype=self.dtype),
+            pad=st["pad"].to(device=self.device, dtype=self.dtype),
+        )
+        self.model.atlas = InfiniteAtlasMTHD.load(self.atlas_path)
+        self.records = self._tail_jsonl(self.log_path, self.cfg.max_records)
+
+    @staticmethod
+    def _tail_jsonl(path: Path, limit: int) -> List[Dict[str, Any]]:
+        if not path.exists():
+            return []
+        out: List[Dict[str, Any]] = []
+        for line in path.read_text(encoding="utf-8").splitlines()[-limit:]:
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+        return out
+
+    def _append_jsonl(self, record: Dict[str, Any]) -> None:
+        with self.log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+    @torch.no_grad()
+    def probe(self, state: Optional[FoldedOmegaCuboState] = None) -> Probe:
+        if state is None:
+            if self.state is None:
+                raise RuntimeError("state is not initialized")
+            state = self.state
+        obs = self.model.base.cubo_observation(state)
+        xi = self.model.pack(state)
+        coh, speed, info_energy = self.model.base.core.coherence_energy(xi)
+        omega = mean_float(obs["omega"])
+        closure_score = mean_float(obs["closure_score"])
+        coherence = safe_float(coh.detach().cpu())
+        debt = max(0.0, omega) + max(0.0, 1.0 - closure_score) + math.log1p(max(0.0, coherence)) / 10.0
+        return Probe(
+            tick=self.tick,
+            debt=debt,
+            omega=omega,
+            closure_score=closure_score,
+            absorption=mean_float(obs["absorption"]),
+            residual=mean_float(obs["residual"]),
+            coherence=coherence,
+            speed=safe_float(speed.detach().mean().cpu()),
+            info_energy=safe_float(info_energy.detach().cpu()),
+            z_digest=tensor_digest(state.z),
+            memory_digest=tensor_digest(state.memory),
+            relations_digest=tensor_digest(state.relations),
+            cubo_digest=tensor_digest(state.cubo),
+        )
+
+    @torch.no_grad()
+    def fold_record(self, phase: str, record: Dict[str, Any]) -> Dict[str, Any]:
+        if self.state is None:
+            raise RuntimeError("state is not initialized")
+        key = f"runtime/{self.tick:012d}/{phase}/{digest_obj(record, 20)}"
+        self.state, receipt = self.model.put_state(self.state, key, json_bytes(record))
+        for _ in range(max(1, int(self.cfg.closure_steps))):
+            self.state = self.model.forward_state(self.state)
+        return {"key": key, "receipt": receipt_to_json(receipt)}
+
+    def propose(self, observation: Observador, probe: Probe) -> List[Action]:
+        text = observation.x.strip().replace("\n", " ")[: self.cfg.text_max]
+        return [
+            Action("text", f"debt={probe.debt:.6f} omega={probe.omega:.6f} closure={probe.closure_score:.6f} obs={text}", "externalizar cierre"),
+            Action("memory", f"guardar continuidad obs_hash={digest_obj(observation.record(), 24)} debt={probe.debt:.6f}", "reforzar autobiografia"),
+            Action("self_probe", canonical_json(probe.record())[: self.cfg.text_max], "observar estado interno"),
+            Action("inhibit", "sin accion externa", "preservar estabilidad"),
+        ]
+
+    @torch.no_grad()
+    def simulate(self, action: Action) -> Action:
+        if self.state is None:
+            raise RuntimeError("state is not initialized")
+        key = f"sim/{self.tick:012d}/{action.kind}/{digest_obj(action.record(), 16)}"
+        rule = {"kind": "repeat", "text": action.kind + ":" + action.payload[:256], "n": 1}
+        receipt = self.model.atlas.fold_rule(key, rule, fold=False)
+        sim_state = self.model.fold_receipt_state(self.state, receipt, sign=+1.0)
+        sim_state = self.model.forward_state(sim_state)
+        sim_probe = self.probe(sim_state)
+        action.simulated_debt = sim_probe.debt
+        action.simulated_probe = sim_probe.record()
+        return action
+
+    def choose(self, actions: List[Action]) -> Action:
+        sims = [self.simulate(a) for a in actions]
+        sims.sort(key=lambda a: (a.simulated_debt, 1 if a.kind == "inhibit" else 0))
+        return sims[0]
+
+    @torch.no_grad()
+    def step(self, text: str, source: str = "user", regime: str = "external") -> Dict[str, Any]:
+        if self.state is None:
+            self.init_or_load()
+        self.tick += 1
+        observation = Observador(x=text, source=source, regime=regime)
+        obs_record = {"tick": self.tick, "phase": "observe", "observation": observation.record()}
+        obs_receipt = self.fold_record("observe", obs_record)
+        probe0 = self.probe()
+        actions = self.propose(observation, probe0)
+        chosen = self.choose(actions)
+        action_receipt = self.fold_record("action", {"tick": self.tick, "phase": "action", "action": chosen.record()})
+        visible = chosen.payload
+        reobs = Observador(x=visible, source="ctnet_effector", regime="reobservation", meta={"action_kind": chosen.kind})
+        reobs_receipt = self.fold_record("reobserve", {"tick": self.tick, "phase": "reobserve", "observation": reobs.record()})
+        probe1 = self.probe()
+        event = {
+            "tick": self.tick,
+            "observation": observation.record(),
+            "observe_receipt": obs_receipt,
+            "initial_probe": probe0.record(),
+            "actions": [a.record() for a in actions],
+            "chosen_action": chosen.record(),
+            "action_receipt": action_receipt,
+            "visible": visible,
+            "reobserve_receipt": reobs_receipt,
+            "final_probe": probe1.record(),
+        }
+        self.records.append(event)
+        self.records = self.records[-self.cfg.max_records :]
+        self._append_jsonl(event)
+        self.save()
+        return event
+
+    def status(self) -> Dict[str, Any]:
+        if self.state is None:
+            self.init_or_load()
+        return {
+            "root": str(self.root),
+            "tick": self.tick,
+            "atlas_shape": list(self.model.atlas.shape),
+            "records_loaded": len(self.records),
+            "probe": self.probe().record(),
+            "paths": {"state": str(self.state_path), "atlas": str(self.atlas_path), "log": str(self.log_path)},
+        }
+
+
+def make_config(args: argparse.Namespace) -> RuntimeConfig:
+    return RuntimeConfig(
+        root=args.root,
+        seed=args.seed,
+        dtype="float64" if args.fp64 else "float32",
+        device="cuda" if args.cuda else "cpu",
+        closure_steps=args.closure_steps,
+        consolidation_every=args.consolidation_every,
+    )
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="CTNet runtime loop")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def common(q: argparse.ArgumentParser) -> None:
+        q.add_argument("--root", default=".ctnet_runtime")
+        q.add_argument("--seed", type=int, default=0)
+        q.add_argument("--cuda", action="store_true")
+        q.add_argument("--fp64", action="store_true")
+        q.add_argument("--closure-steps", type=int, default=1)
+        q.add_argument("--consolidation-every", type=int, default=16)
+
+    q = sub.add_parser("init")
+    common(q)
+    q = sub.add_parser("status")
+    common(q)
+    q = sub.add_parser("step")
+    common(q)
+    q.add_argument("--observe", required=True)
+    q.add_argument("--source", default="user")
+    q.add_argument("--regime", default="external")
+
+    args = p.parse_args()
+    rt = CTNetRuntimeLoop(make_config(args))
+    rt.init_or_load()
+    if args.cmd == "init":
+        print(json.dumps(rt.status(), indent=2, ensure_ascii=False))
+    elif args.cmd == "status":
+        print(json.dumps(rt.status(), indent=2, ensure_ascii=False))
+    elif args.cmd == "step":
+        print(json.dumps(rt.step(args.observe, source=args.source, regime=args.regime), indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
