@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CTNet runtime loop v0.4.1.
+CTNet runtime loop v0.5.
 
 Ciclo operativo persistente para CTNet-Omega-Cubo6D + MTHD:
 observacion -> pliegue -> medicion -> simulacion de ciclo completo -> accion
@@ -22,6 +22,10 @@ del Cubo6D quedan como diagnostico, no como ley de decision primaria.
 
 v0.4.1 resuelve de forma robusta el nucleo fractal real: en algunos layouts esta
 en base.core, y en otros en base.core.core.
+
+v0.5 introduce consolidate_u_p: un efector interno que convierte la trayectoria
+reciente de cierre en una regla MTHD corta. La regla solo gana si su simulacion
+reduce closure_debt = coherence_debt + up_debt; si no, gana inhibit.
 """
 from __future__ import annotations
 
@@ -104,7 +108,7 @@ class Observador:
 class Probe:
     tick: int
 
-    # Ley de gobierno v0.4: tensor de coherencia + cierre u/p.
+    # Ley de gobierno v0.4+: tensor de coherencia + cierre u/p.
     debt: float
     closure_debt: float
     coherence_debt: float
@@ -156,6 +160,7 @@ class RuntimeConfig:
     closure_steps: int = 1
     stabilizer_steps: int = 1
     consolidation_every: int = 16
+    consolidation_window: int = 8
     max_records: int = 2048
     text_max: int = 480
 
@@ -325,6 +330,72 @@ class CTNetRuntimeLoop:
             cubo_digest=tensor_digest(state.cubo),
         )
 
+    @staticmethod
+    def compact_probe(probe: Probe) -> Dict[str, float]:
+        return {
+            "closure_debt": probe.closure_debt,
+            "coherence_debt": probe.coherence_debt,
+            "up_debt": probe.up_debt,
+            "coherence": probe.coherence,
+            "up_error": probe.up_error,
+            "up_forward_mse": probe.up_forward_mse,
+            "up_inverse_mse": probe.up_inverse_mse,
+        }
+
+    @staticmethod
+    def probe_debt(record: Dict[str, Any], name: str) -> float:
+        probe = record.get(name, {}) or {}
+        return safe_float(probe.get("closure_debt", probe.get("debt", 0.0)))
+
+    def recent_closure_trace(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        window = int(limit if limit is not None else self.cfg.consolidation_window)
+        out: List[Dict[str, Any]] = []
+        for rec in self.records[-max(1, window) :]:
+            initial = self.probe_debt(rec, "initial_probe")
+            final = self.probe_debt(rec, "final_probe")
+            chosen = (rec.get("chosen_action") or {}).get("kind", "unknown")
+            out.append(
+                {
+                    "tick": rec.get("tick"),
+                    "chosen": chosen,
+                    "initial_closure_debt": initial,
+                    "final_closure_debt": final,
+                    "delta_debt": safe_float(rec.get("delta_debt", final - initial)),
+                    "closed": bool(rec.get("closed_debt", final <= initial)),
+                    "governance": rec.get("governance", "legacy"),
+                }
+            )
+        return out
+
+    def consolidation_rule(self, observation: Observador, probe: Probe) -> Dict[str, Any]:
+        trace = self.recent_closure_trace(self.cfg.consolidation_window)
+        by_action: Dict[str, Dict[str, float]] = {}
+        for item in trace:
+            kind = str(item.get("chosen", "unknown"))
+            slot = by_action.setdefault(kind, {"count": 0.0, "sum_delta": 0.0, "min_delta": float("inf")})
+            delta = safe_float(item.get("delta_debt", 0.0))
+            slot["count"] += 1.0
+            slot["sum_delta"] += delta
+            slot["min_delta"] = min(slot["min_delta"], delta)
+        for slot in by_action.values():
+            count = max(1.0, slot["count"])
+            slot["mean_delta"] = slot["sum_delta"] / count
+            if math.isinf(slot["min_delta"]):
+                slot["min_delta"] = 0.0
+
+        summary = {
+            "schema": "ctnet.consolidate_u_p.v1",
+            "governance": "coherence_tensor_plus_u_p",
+            "tick": self.tick,
+            "observation_digest": digest_obj(observation.record(), 24),
+            "baseline": self.compact_probe(probe),
+            "trace": trace,
+            "by_action": by_action,
+            "acceptance": "fold only if simulated closure_debt decreases relative to baseline; otherwise inhibit",
+        }
+        text = canonical_json(summary)
+        return {"kind": "repeat", "text": text[:4096], "n": 1}
+
     @torch.no_grad()
     def fold_record(self, phase: str, record: Dict[str, Any]) -> Dict[str, Any]:
         if self.state is None:
@@ -346,6 +417,28 @@ class CTNetRuntimeLoop:
         return sim_state
 
     @torch.no_grad()
+    def simulate_consolidation(self, state: FoldedOmegaCuboState, action: Action) -> FoldedOmegaCuboState:
+        payload = json.loads(action.payload)
+        key = f"sim/{self.tick:012d}/consolidate_u_p/{payload['rule_digest']}"
+        receipt = self.model.atlas.fold_rule(key, payload["rule"], fold=False)
+        sim_state = self.model.fold_receipt_state(state, receipt, sign=+1.0)
+        for _ in range(max(1, int(self.cfg.closure_steps))):
+            sim_state = self.model.forward_state(sim_state)
+        return sim_state
+
+    @torch.no_grad()
+    def fold_consolidation(self, action: Action) -> Dict[str, Any]:
+        if self.state is None:
+            raise RuntimeError("state is not initialized")
+        payload = json.loads(action.payload)
+        key = f"runtime/{self.tick:012d}/consolidate_u_p/{payload['rule_digest']}"
+        receipt = self.model.atlas.fold_rule(key, payload["rule"], fold=True)
+        self.state = self.model.fold_receipt_state(self.state, receipt, sign=+1.0)
+        for _ in range(max(1, int(self.cfg.closure_steps))):
+            self.state = self.model.forward_state(self.state)
+        return {"key": key, "receipt": receipt_to_json(receipt), "rule_digest": payload["rule_digest"]}
+
+    @torch.no_grad()
     def apply_internal_effect(self, state: FoldedOmegaCuboState, action: Action) -> FoldedOmegaCuboState:
         if action.kind != "stabilize":
             return state
@@ -356,10 +449,17 @@ class CTNetRuntimeLoop:
 
     def propose(self, observation: Observador, probe: Probe) -> List[Action]:
         text = observation.x.strip().replace("\n", " ")[: self.cfg.text_max]
+        consolidation_rule = self.consolidation_rule(observation, probe)
+        consolidation_payload = {
+            "rule_digest": digest_obj(consolidation_rule, 24),
+            "rule": consolidation_rule,
+            "window": int(self.cfg.consolidation_window),
+        }
         return [
             Action("text", f"closure_debt={probe.closure_debt:.6f} coh={probe.coherence:.6g} up={probe.up_error:.6g} obs={text}", "externalizar cierre desde tensor de coherencia + u/p"),
             Action("memory", f"guardar continuidad obs_hash={digest_obj(observation.record(), 24)} closure_debt={probe.closure_debt:.6f}", "reforzar autobiografia si mejora cierre u/p"),
             Action("self_probe", canonical_json({"closure_debt": probe.closure_debt, "coherence": probe.coherence, "up_error": probe.up_error, "up_forward_mse": probe.up_forward_mse, "up_inverse_mse": probe.up_inverse_mse})[: self.cfg.text_max], "observar tensor de coherencia y cierre u/p"),
+            Action("consolidate_u_p", canonical_json(consolidation_payload), "plegar regla MTHD corta si reduce closure_debt"),
             Action("stabilize", f"aplicar {max(1, int(self.cfg.stabilizer_steps))} paso(s) inverso(s) CTNet antes de reobservacion", "regular deriva interna reversible medida por coherencia + u/p"),
             Action("inhibit", "sin accion ni reobservacion", "preservar cierre u/p cuando toda accion abre deuda"),
         ]
@@ -371,6 +471,9 @@ class CTNetRuntimeLoop:
             return "internal_memory_written:" + action.payload
         if action.kind == "self_probe":
             return "self_probe:" + action.payload
+        if action.kind == "consolidate_u_p":
+            payload = json.loads(action.payload)
+            return "internal_consolidated_u_p:" + payload["rule_digest"]
         if action.kind == "stabilize":
             return "internal_stabilized:" + action.payload
         if action.kind == "inhibit":
@@ -387,6 +490,13 @@ class CTNetRuntimeLoop:
             action.simulated_delta = probe.debt - baseline_debt
             action.simulated_probe = probe.record()
             return action
+        if action.kind == "consolidate_u_p":
+            sim_state = self.simulate_consolidation(clone_state(self.state), action)
+            sim_probe = self.probe(sim_state)
+            action.simulated_debt = sim_probe.debt
+            action.simulated_delta = sim_probe.debt - baseline_debt
+            action.simulated_probe = sim_probe.record()
+            return action
         sim_state = clone_state(self.state)
         sim_state = self.simulate_fold_record(sim_state, "action", {"tick": self.tick, "phase": "action", "action": action.record()})
         sim_state = self.apply_internal_effect(sim_state, action)
@@ -401,7 +511,7 @@ class CTNetRuntimeLoop:
 
     def choose(self, actions: Iterable[Action], baseline_debt: float) -> Action:
         sims = [self.simulate_full_cycle(a, baseline_debt) for a in actions]
-        # La eleccion se ordena por delta de closure_debt, que en v0.4 es CoherenceTensor + u/p.
+        # La eleccion se ordena por delta de closure_debt, que en v0.5 es CoherenceTensor + u/p.
         sims.sort(key=lambda a: (a.simulated_delta, a.simulated_debt, 1 if a.kind == "inhibit" else 0))
         return sims[0]
 
@@ -420,7 +530,9 @@ class CTNetRuntimeLoop:
         action_receipt = None
         reobs_receipt = None
         visible = self.visible_from_action(chosen)
-        if chosen.kind != "inhibit":
+        if chosen.kind == "consolidate_u_p":
+            action_receipt = self.fold_consolidation(chosen)
+        elif chosen.kind != "inhibit":
             action_receipt = self.fold_record("action", {"tick": self.tick, "phase": "action", "action": chosen.record()})
             self.state = self.apply_internal_effect(self.state, chosen)
             reobs = Observador(x=visible, source="ctnet_effector", regime="reobservation", meta={"action_kind": chosen.kind})
@@ -442,6 +554,7 @@ class CTNetRuntimeLoop:
             "delta_debt": final_delta,
             "closed_debt": final_delta <= 0.0,
             "governance": "coherence_tensor_plus_u_p",
+            "consolidation_window": int(self.cfg.consolidation_window),
         }
         self.records.append(event)
         self.records = self.records[-self.cfg.max_records :]
@@ -460,6 +573,7 @@ class CTNetRuntimeLoop:
             "records_loaded": len(self.records),
             "governance": "coherence_tensor_plus_u_p",
             "probe": probe.record(),
+            "recent_closure_trace": self.recent_closure_trace(self.cfg.consolidation_window),
             "paths": {"state": str(self.state_path), "atlas": str(self.atlas_path), "log": str(self.log_path)},
         }
 
@@ -473,6 +587,7 @@ def make_config(args: argparse.Namespace) -> RuntimeConfig:
         closure_steps=args.closure_steps,
         stabilizer_steps=args.stabilizer_steps,
         consolidation_every=args.consolidation_every,
+        consolidation_window=args.consolidation_window,
     )
 
 
@@ -488,6 +603,7 @@ def main() -> None:
         q.add_argument("--closure-steps", type=int, default=1)
         q.add_argument("--stabilizer-steps", type=int, default=1)
         q.add_argument("--consolidation-every", type=int, default=16)
+        q.add_argument("--consolidation-window", type=int, default=8)
 
     q = sub.add_parser("init")
     common(q)
