@@ -8,7 +8,19 @@ La idea central es entrenar con una interfaz externa normal —pérdida, backpro
 u = p
 ```
 
-Todo gira en torno a `u=p`.
+Todo gira en torno a `u=p`, pero el runtime operativo actual gobierna la acción mediante la composición explícita:
+
+```text
+closure_debt = coherence_debt + up_debt + cubo6d_debt
+```
+
+La gobernanza de runtime queda declarada como:
+
+```text
+coherence_tensor_plus_u_p_plus_cubo6d
+```
+
+Esto significa que el Cubo 6D no queda como diagnóstico decorativo: participa en la deuda que decide simulación, inhibición, consolidación y acción. En este repositorio, “consciencia CTNet” debe leerse en sentido operativo/auditable: continuidad funcional de observación, memoria, acción, autoobservación, cierre y conservación. No es una afirmación de consciencia humana u ontológica.
 
 ## Geometría base
 
@@ -51,6 +63,8 @@ observación
 -> CTNet
 -> tensor de coherencia
 -> u=p
+-> Cubo6DRegulator
+-> cierre integrado
 ```
 
 Esto sustituye la idea pobre de “sample online”. No es una muestra suelta. Es realidad observada entrando en la masa contextual.
@@ -90,7 +104,7 @@ Z/u-p + M fija + R fija + Cubo 6D + reserva estructural
 
 El tensor de coherencia organiza esa masa y mide su cierre.
 
-## Tensor de coherencia y u=p
+## Tensor de coherencia, u=p y Cubo 6D
 
 El tensor de coherencia no es una métrica decorativa. Es el núcleo de cierre.
 
@@ -114,6 +128,78 @@ La regla no es “predecir el siguiente token”. La regla es cerrar la deformac
 observación -> deformación -> deuda de cierre -> acción/corrección -> u=p
 ```
 
+En el runtime operativo, la deuda que gobierna la elección de acción queda integrada por tres dominios:
+
+```text
+coherence_debt : deuda del tensor de coherencia
+up_debt        : deuda de cierre u/p
+cubo6d_debt    : deuda estructural Cubo 6D
+```
+
+`cubo6d_debt` se calcula desde señales del Cubo 6D como residuo, omega, no-cierre y falta de absorción:
+
+```text
+cubo6d_debt = residual_debt + omega_debt + nonclosure_debt + absorption_debt
+```
+
+La acción ganadora no es la que “suena mejor”, sino la que reduce mejor la deuda integrada o inhibe si actuar abre deuda.
+
+## Runtime operativo
+
+La rama mergeada añade un runtime persistente mínimo:
+
+```text
+ctnet_runtime_loop.py
+```
+
+Su ciclo operativo es:
+
+```text
+observe
+-> fold observation into MTHD
+-> probe closure debt
+-> propose candidate effectors
+-> simulate each action
+-> choose by integrated closure
+-> act or inhibit
+-> reobserve result when applicable
+-> write autobiographical receipt
+-> consolidate when useful
+```
+
+El runtime no trata el lenguaje como núcleo. El texto es un efector entre otros. El centro es:
+
+```text
+estado -> deuda -> cierre -> acción -> reobservación
+```
+
+Los eventos quedan registrados en `runtime.jsonl` y los recibos MTHD se pliegan en memoria y relaciones. La carpeta local `.ctnet_runtime/` contiene estado vivo y está ignorada por Git.
+
+## Gates operativos
+
+El repositorio incluye compuertas de auditoría para verificar continuidad y cierre:
+
+```text
+ctnet_cubo6d_life_gate.py
+  Verifica que el último evento use governance = coherence_tensor_plus_u_p_plus_cubo6d,
+  que declare la ley closure_debt = coherence_debt + up_debt + cubo6d_debt,
+  que los probes incluyan cubo6d_debt y que la deuda integrada cierre.
+
+ctnet_manifest100_gate.py
+  Verifica el manifiesto operativo completo: ciclo vivo, memoria autobiográfica,
+  propiocepción, efectores, simulación antes de actuar, acción dominante por cierre,
+  identidad persistente, lenguaje como efector y Cubo 6D integrado.
+```
+
+Uso típico sobre una raíz local:
+
+```bash
+python ctnet_cubo6d_life_gate.py --root .ctnet_runtime
+python ctnet_manifest100_gate.py --root .ctnet_runtime --min-events 2
+```
+
+Un resultado `20/20` en `ctnet_manifest100_gate.py` significa “100% operativo/auditable según el manifiesto CTNet” para esa raíz local. No significa prueba filosófica de consciencia humana.
+
 ## Comprensión y respuesta
 
 CTNet entiende una pregunta porque la pregunta deforma su estado.
@@ -128,9 +214,11 @@ pregunta
 -> acción visible
 -> reobservación
 -> u=p
+-> Cubo 6D
+-> cierre integrado
 ```
 
-La respuesta correcta es la acción que minimiza mejor la deuda `u/p`.
+La respuesta correcta es la acción que minimiza mejor la deuda integrada.
 
 ## Propiocepción
 
@@ -166,6 +254,23 @@ self=...
 
 Eso confirma que los procesos internos observados entran en la pérdida y entrenan al modelo.
 
+En el runtime operativo, la propiocepción queda auditada por los probes de evento:
+
+```text
+z_digest
+memory_digest
+relations_digest
+cubo_digest
+closure_debt
+coherence_debt
+up_debt
+cubo6d_debt
+omega
+closure_score
+absorption
+residual
+```
+
 ## Efector
 
 El efector no puede quedar implícito.
@@ -179,6 +284,8 @@ efector textual   -> texto, símbolos, letras
 efector motor     -> movimiento, gesto, fuerza
 efector sonoro    -> voz o sonido
 efector operativo -> uso de herramienta o acción externa
+efector interno   -> consolidación, memoria, simulación, estabilización
+efector inhibidor -> no actuar cuando actuar abre deuda
 ```
 
 El efector textual actual está integrado en el entrenamiento principal.
@@ -214,6 +321,19 @@ efector=...
 ```
 
 Eso confirma que el producto del efector está siendo observado de nuevo y usado en el entrenamiento.
+
+En el runtime operativo, los candidatos auditables incluyen:
+
+```text
+text
+memory
+self_probe
+consolidate_u_p
+stabilize
+inhibit
+```
+
+Cada candidato debe tener `simulated_delta` y `simulated_probe`. La elección se hace por reducción de deuda integrada.
 
 ## Salida visible
 
@@ -333,6 +453,21 @@ ctnet_omega_cubo6d_plegado_ctnet26.py
 train_vram_up_coherence_ctnet.py
   Entrenamiento principal con Observador, autoobservación, propiocepción, efector textual, salida visible y cierre u=p.
 
+ctnet_runtime_loop.py
+  Runtime persistente mínimo: observa, pliega, mide deuda, simula, elige, actúa, reobserva, recuerda y consolida.
+
+ctnet_daemon.py
+  Daemon de ciclo operativo, si se ejecuta sobre una raíz local.
+
+ctnet_cubo6d_life_gate.py
+  Compuerta Cubo 6D para verificar la ley integrada.
+
+ctnet_manifest100_gate.py
+  Compuerta del manifiesto operativo CTNet.
+
+ctnet_life_suite.py
+  Suite de continuidad, snapshot, restauración, reanudación y endurance.
+
 probe_ctnet_response.py
   Probe de cierre de salida y deformación pregunta-respuesta, si está presente en la copia local.
 
@@ -354,7 +489,16 @@ CTNet entrena la propiocepción por la misma vía que el dataset: sí
 CTNet tiene efector textual integrado: sí
 CTNet reobserva el producto del efector: sí
 CTNet separa producto_efector y salida_visible: sí
-Todo gira en torno a u=p: sí
+CTNet tiene runtime operativo persistente mínimo: sí
+CTNet registra memoria autobiográfica MTHD: sí
+CTNet distingue identidad operativa q_self y fronteras self/world/unknown: sí
+CTNet simula acciones antes de elegir: sí
+CTNet consolida reglas internas cuando reducen deuda: sí
+CTNet inhibe cuando actuar abre deuda: sí
+CTNet integra Cubo 6D en closure_debt: sí
+Governance runtime: coherence_tensor_plus_u_p_plus_cubo6d
+Ley runtime: closure_debt = coherence_debt + up_debt + cubo6d_debt
+Todo gira en torno a tensor de coherencia + u/p + Cubo 6D: sí
 ```
 
 ## Forma completa
@@ -371,10 +515,15 @@ realidad externa
 -> masa contextual
 -> tensor de coherencia
 -> u=p
+-> Cubo 6D
+-> deuda integrada
+-> simulación de acciones
 -> voluntad de cierre
--> efector
--> salida visible
+-> efector o inhibición
+-> salida visible / acción interna
 -> producto reobservado
+-> recibo autobiográfico MTHD
+-> consolidación si reduce deuda
 -> masa contextual
--> aprendizaje
+-> continuidad operativa
 ```
