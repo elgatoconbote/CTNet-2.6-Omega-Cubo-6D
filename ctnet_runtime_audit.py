@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CTNet runtime continuity audit v0.1.
+CTNet runtime continuity audit v0.2.
 
 Audita una instancia local de CTNetRuntimeLoop/CTNetDaemon sin ejecutar nuevos
 ciclos. Lee runtime.jsonl, daemon.jsonl y self_identity.json, y produce un
@@ -16,6 +16,10 @@ Criterios auditados:
 - inhibiciones homeostaticas con delta cero
 - existencia de carta raiz de identidad
 - supervivencia de la traza en ficheros persistentes
+
+v0.2 separa dos lecturas:
+- historical_window: ventana solicitada, puede contener eventos legacy.
+- mature_phase: tramo desde el primer evento gobernado por coherence_tensor_plus_u_p.
 """
 from __future__ import annotations
 
@@ -24,6 +28,9 @@ import json
 import statistics
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+
+GOVERNANCE = "coherence_tensor_plus_u_p"
+EPS = 1.0e-12
 
 
 def safe_float(x: Any, default: float = 0.0) -> float:
@@ -112,6 +119,78 @@ def monotonic_ticks(items: List[Dict[str, Any]]) -> bool:
     return all(b > a for a, b in zip(ticks, ticks[1:]))
 
 
+def current_streak(events: List[Dict[str, Any]], kind: Optional[str] = None, governance: Optional[str] = None) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for event in reversed(events):
+        if kind is not None and event.get("kind") != kind:
+            break
+        if governance is not None and event.get("governance") != governance:
+            break
+        out.append(event)
+    return list(reversed(out))
+
+
+def first_governed_phase(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    for i, event in enumerate(events):
+        if event.get("governance") == GOVERNANCE:
+            return events[i:]
+    return []
+
+
+def phase_stats(events: List[Dict[str, Any]], *, label: str) -> Dict[str, Any]:
+    deltas = [safe_float(e.get("delta_debt")) for e in events]
+    negative = [d for d in deltas if d < -EPS]
+    zero = [d for d in deltas if abs(d) <= EPS]
+    positive = [d for d in deltas if d > EPS]
+    first_debt = events[0].get("initial_closure_debt") if events else None
+    last_debt = events[-1].get("final_closure_debt") if events else None
+    net_delta = None
+    if isinstance(first_debt, (int, float)) and isinstance(last_debt, (int, float)):
+        net_delta = safe_float(last_debt) - safe_float(first_debt)
+
+    return {
+        "label": label,
+        "events": len(events),
+        "first_tick": events[0].get("tick") if events else None,
+        "latest_tick": events[-1].get("tick") if events else None,
+        "latest_action": events[-1].get("kind") if events else None,
+        "latest_delta_debt": events[-1].get("delta_debt") if events else None,
+        "net_delta": net_delta,
+        "mean_delta": statistics.mean(deltas) if deltas else None,
+        "min_delta": min(deltas) if deltas else None,
+        "max_delta": max(deltas) if deltas else None,
+        "negative_steps": len(negative),
+        "zero_steps": len(zero),
+        "positive_steps": len(positive),
+        "actions": count_by(events, "kind"),
+        "governance": count_by(events, "governance"),
+        "tail": events,
+    }
+
+
+def score_phase(events: List[Dict[str, Any]], identity: Optional[Dict[str, Any]], daemon_events: List[Dict[str, Any]], state_path: Path, atlas_path: Path) -> Dict[str, Any]:
+    consolidations = [e for e in events if e.get("kind") == "consolidate_u_p"]
+    inhibitions = [e for e in events if e.get("kind") == "inhibit"]
+    negative = [e for e in events if safe_float(e.get("delta_debt")) < -EPS]
+    score_parts = {
+        "has_runtime_log": bool(events),
+        "ticks_monotonic": monotonic_ticks(events),
+        "governed_phase": bool(events) and all(e.get("governance") == GOVERNANCE for e in events),
+        "has_negative_closure": bool(negative),
+        "has_homeostatic_inhibition": bool(inhibitions) and any(abs(safe_float(e.get("delta_debt"))) <= EPS for e in inhibitions),
+        "has_metabolic_consolidation": bool(consolidations) and all(safe_float(e.get("delta_debt")) < -EPS for e in consolidations[-min(3, len(consolidations)) :]),
+        "identity_bound": bool(identity and identity.get("schema") == "ctnet.self_identity.v1"),
+        "state_persisted": state_path.exists(),
+        "atlas_persisted": atlas_path.exists(),
+        "daemon_trace_exists": bool(daemon_events),
+    }
+    return {
+        "score": sum(1 for v in score_parts.values() if v),
+        "score_total": len(score_parts),
+        "score_parts": score_parts,
+    }
+
+
 def audit(root: Path, window: int = 16) -> Dict[str, Any]:
     runtime_log = root / "runtime.jsonl"
     daemon_log = root / "daemon.jsonl"
@@ -121,20 +200,10 @@ def audit(root: Path, window: int = 16) -> Dict[str, Any]:
 
     events_raw = read_jsonl(runtime_log)
     events = [compact_event(e) for e in events_raw if "tick" in e]
-    tail = events[-max(1, int(window)) :]
-    deltas = [safe_float(e.get("delta_debt")) for e in tail]
-    negative = [d for d in deltas if d < 0]
-    zero = [d for d in deltas if abs(d) <= 1.0e-12]
-    positive = [d for d in deltas if d > 1.0e-12]
-    consolidations = [e for e in tail if e.get("kind") == "consolidate_u_p"]
-    inhibitions = [e for e in tail if e.get("kind") == "inhibit"]
-    governed = [e for e in tail if e.get("governance") == "coherence_tensor_plus_u_p"]
-
-    first_debt = tail[0].get("initial_closure_debt") if tail else None
-    last_debt = tail[-1].get("final_closure_debt") if tail else None
-    net_delta = None
-    if isinstance(first_debt, (int, float)) and isinstance(last_debt, (int, float)):
-        net_delta = safe_float(last_debt) - safe_float(first_debt)
+    historical_tail = events[-max(1, int(window)) :]
+    mature_phase_all = first_governed_phase(events)
+    mature_tail = mature_phase_all[-max(1, int(window)) :]
+    consolidation_streak = current_streak(events, kind="consolidate_u_p", governance=GOVERNANCE)
 
     identity = None
     if identity_path.exists():
@@ -144,48 +213,33 @@ def audit(root: Path, window: int = 16) -> Dict[str, Any]:
             identity = {"_decode_error": True}
 
     daemon_events = read_jsonl(daemon_log)
+    historical_score = score_phase(historical_tail, identity, daemon_events, state_path, atlas_path)
+    mature_score = score_phase(mature_tail, identity, daemon_events, state_path, atlas_path)
 
-    score_parts = {
-        "has_runtime_log": bool(events),
-        "ticks_monotonic": monotonic_ticks(events),
-        "governed_tail": bool(tail) and len(governed) == len(tail),
-        "has_negative_closure": bool(negative),
-        "has_homeostatic_inhibition": bool(inhibitions) and any(abs(safe_float(e.get("delta_debt"))) <= 1.0e-12 for e in inhibitions),
-        "has_metabolic_consolidation": bool(consolidations) and all(safe_float(e.get("delta_debt")) < 0 for e in consolidations[-min(3, len(consolidations)) :]),
-        "identity_bound": bool(identity and identity.get("schema") == "ctnet.self_identity.v1"),
-        "state_persisted": state_path.exists(),
-        "atlas_persisted": atlas_path.exists(),
-        "daemon_trace_exists": bool(daemon_events),
-    }
-    score = sum(1 for v in score_parts.values() if v)
-
+    latest = events[-1] if events else {}
     return {
         "root": str(root),
         "runtime_events": len(events),
         "daemon_events": len(daemon_events),
-        "window": len(tail),
-        "latest_tick": tail[-1].get("tick") if tail else None,
-        "latest_action": tail[-1].get("kind") if tail else None,
-        "latest_delta_debt": tail[-1].get("delta_debt") if tail else None,
-        "net_window_delta": net_delta,
-        "mean_window_delta": statistics.mean(deltas) if deltas else None,
-        "min_window_delta": min(deltas) if deltas else None,
-        "max_window_delta": max(deltas) if deltas else None,
-        "negative_steps": len(negative),
-        "zero_steps": len(zero),
-        "positive_steps": len(positive),
-        "actions": count_by(tail, "kind"),
-        "governance": count_by(tail, "governance"),
-        "score": score,
-        "score_total": len(score_parts),
-        "score_parts": score_parts,
+        "latest_tick": latest.get("tick"),
+        "latest_action": latest.get("kind"),
+        "latest_delta_debt": latest.get("delta_debt"),
         "identity": {
             "exists": identity is not None,
             "schema": identity.get("schema") if isinstance(identity, dict) else None,
             "q_self": identity.get("q_self") if isinstance(identity, dict) else None,
             "governance": identity.get("governance") if isinstance(identity, dict) else None,
         },
-        "tail": tail,
+        "historical_window": {
+            **phase_stats(historical_tail, label="historical_window"),
+            **historical_score,
+        },
+        "mature_phase": {
+            **phase_stats(mature_tail, label="mature_phase"),
+            **mature_score,
+            "all_mature_events": len(mature_phase_all),
+        },
+        "current_consolidation_streak": phase_stats(consolidation_streak, label="current_consolidation_streak"),
     }
 
 
@@ -194,19 +248,30 @@ def main() -> None:
     parser.add_argument("--root", default=".ctnet_runtime")
     parser.add_argument("--window", type=int, default=16)
     parser.add_argument("--compact", action="store_true")
+    parser.add_argument("--mature", action="store_true", help="compact output focused on the governed mature phase")
     args = parser.parse_args()
 
     report = audit(Path(args.root), window=args.window)
     if args.compact:
+        phase = report["mature_phase"] if args.mature else report["historical_window"]
         compact = {
+            "phase": phase["label"],
             "latest_tick": report["latest_tick"],
             "latest_action": report["latest_action"],
             "latest_delta_debt": report["latest_delta_debt"],
-            "net_window_delta": report["net_window_delta"],
-            "score": f"{report['score']}/{report['score_total']}",
-            "actions": report["actions"],
-            "governance": report["governance"],
+            "phase_net_delta": phase["net_delta"],
+            "phase_mean_delta": phase["mean_delta"],
+            "score": f"{phase['score']}/{phase['score_total']}",
+            "actions": phase["actions"],
+            "governance": phase["governance"],
             "identity": report["identity"],
+            "current_consolidation_streak": {
+                "events": report["current_consolidation_streak"]["events"],
+                "first_tick": report["current_consolidation_streak"]["first_tick"],
+                "latest_tick": report["current_consolidation_streak"]["latest_tick"],
+                "net_delta": report["current_consolidation_streak"]["net_delta"],
+                "mean_delta": report["current_consolidation_streak"]["mean_delta"],
+            },
         }
         print(json.dumps(compact, ensure_ascii=False, indent=2, sort_keys=True))
     else:
