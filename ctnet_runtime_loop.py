@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CTNet runtime loop v0.2.
+CTNet runtime loop v0.3.
 
 Ciclo operativo persistente para CTNet-Omega-Cubo6D + MTHD:
 observacion -> pliegue -> medicion -> simulacion de ciclo completo -> accion
 -> reobservacion -> memoria.
 
-La version v0.2 corrige la seleccion de acciones: cada candidato se simula hasta
-su reobservacion, y no solo como pliegue aislado. Asi la accion elegida se mide
-contra el mismo tipo de deuda que despues se registra como final_probe.
+v0.2 corrigio la seleccion de acciones: cada candidato se simula hasta su
+reobservacion, y no solo como pliegue aislado.
+
+v0.3 introduce dos reguladores necesarios:
+- inhibit: accion nula real. No escribe accion ni reobservacion cuando todos los
+  candidatos abren deuda.
+- stabilize: accion interna reversible que aplica pasos inversos CTNet tras el
+  pliegue de accion antes de reobservar.
 """
 from __future__ import annotations
 
@@ -127,6 +132,7 @@ class RuntimeConfig:
     mthd_seed: str = "ctnet-runtime"
     mthd_omega_words: int = 256
     closure_steps: int = 1
+    stabilizer_steps: int = 1
     consolidation_every: int = 16
     max_records: int = 2048
     text_max: int = 480
@@ -238,8 +244,6 @@ class CTNetRuntimeLoop:
         omega = mean_float(obs["omega"])
         closure_score = mean_float(obs["closure_score"])
         coherence = safe_float(coh.detach().cpu())
-        # Debt v0.2: el componente de coherencia se mantiene logaritmico para evitar
-        # que una energia grande anule omega/residual, pero conserva monotonia.
         debt = max(0.0, omega) + max(0.0, 1.0 - closure_score) + math.log1p(max(0.0, coherence)) / 10.0
         return Probe(
             tick=self.tick,
@@ -277,13 +281,23 @@ class CTNetRuntimeLoop:
             sim_state = self.model.forward_state(sim_state)
         return sim_state
 
+    @torch.no_grad()
+    def apply_internal_effect(self, state: FoldedOmegaCuboState, action: Action) -> FoldedOmegaCuboState:
+        if action.kind != "stabilize":
+            return state
+        out = state
+        for _ in range(max(1, int(self.cfg.stabilizer_steps))):
+            out = self.model.inverse_state(out)
+        return out
+
     def propose(self, observation: Observador, probe: Probe) -> List[Action]:
         text = observation.x.strip().replace("\n", " ")[: self.cfg.text_max]
         return [
             Action("text", f"debt={probe.debt:.6f} omega={probe.omega:.6f} closure={probe.closure_score:.6f} obs={text}", "externalizar cierre"),
             Action("memory", f"guardar continuidad obs_hash={digest_obj(observation.record(), 24)} debt={probe.debt:.6f}", "reforzar autobiografia"),
             Action("self_probe", canonical_json(probe.record())[: self.cfg.text_max], "observar estado interno"),
-            Action("inhibit", "sin accion externa", "preservar estabilidad"),
+            Action("stabilize", f"aplicar {max(1, int(self.cfg.stabilizer_steps))} paso(s) inverso(s) CTNet antes de reobservacion", "regular deriva interna reversible"),
+            Action("inhibit", "sin accion ni reobservacion", "preservar estabilidad cuando toda accion abre deuda"),
         ]
 
     def visible_from_action(self, action: Action) -> str:
@@ -293,6 +307,8 @@ class CTNetRuntimeLoop:
             return "internal_memory_written:" + action.payload
         if action.kind == "self_probe":
             return "self_probe:" + action.payload
+        if action.kind == "stabilize":
+            return "internal_stabilized:" + action.payload
         if action.kind == "inhibit":
             return "inhibited_action:" + action.payload
         return action.payload
@@ -301,8 +317,15 @@ class CTNetRuntimeLoop:
     def simulate_full_cycle(self, action: Action, baseline_debt: float) -> Action:
         if self.state is None:
             raise RuntimeError("state is not initialized")
+        if action.kind == "inhibit":
+            probe = self.probe(self.state)
+            action.simulated_debt = probe.debt
+            action.simulated_delta = probe.debt - baseline_debt
+            action.simulated_probe = probe.record()
+            return action
         sim_state = clone_state(self.state)
         sim_state = self.simulate_fold_record(sim_state, "action", {"tick": self.tick, "phase": "action", "action": action.record()})
+        sim_state = self.apply_internal_effect(sim_state, action)
         visible = self.visible_from_action(action)
         reobs = Observador(x=visible, source="ctnet_effector", regime="reobservation", meta={"action_kind": action.kind})
         sim_state = self.simulate_fold_record(sim_state, "reobserve", {"tick": self.tick, "phase": "reobserve", "observation": reobs.record()})
@@ -314,7 +337,7 @@ class CTNetRuntimeLoop:
 
     def choose(self, actions: Iterable[Action], baseline_debt: float) -> Action:
         sims = [self.simulate_full_cycle(a, baseline_debt) for a in actions]
-        # Prioridad: menor delta de deuda en ciclo completo. Inhibir solo gana si cierra mejor.
+        # Si ninguna accion cierra deuda, inhibit debe ganar con delta ~= 0.
         sims.sort(key=lambda a: (a.simulated_delta, a.simulated_debt, 1 if a.kind == "inhibit" else 0))
         return sims[0]
 
@@ -329,10 +352,16 @@ class CTNetRuntimeLoop:
         probe0 = self.probe()
         actions = self.propose(observation, probe0)
         chosen = self.choose(actions, baseline_debt=probe0.debt)
-        action_receipt = self.fold_record("action", {"tick": self.tick, "phase": "action", "action": chosen.record()})
+
+        action_receipt = None
+        reobs_receipt = None
         visible = self.visible_from_action(chosen)
-        reobs = Observador(x=visible, source="ctnet_effector", regime="reobservation", meta={"action_kind": chosen.kind})
-        reobs_receipt = self.fold_record("reobserve", {"tick": self.tick, "phase": "reobserve", "observation": reobs.record()})
+        if chosen.kind != "inhibit":
+            action_receipt = self.fold_record("action", {"tick": self.tick, "phase": "action", "action": chosen.record()})
+            self.state = self.apply_internal_effect(self.state, chosen)
+            reobs = Observador(x=visible, source="ctnet_effector", regime="reobservation", meta={"action_kind": chosen.kind})
+            reobs_receipt = self.fold_record("reobserve", {"tick": self.tick, "phase": "reobserve", "observation": reobs.record()})
+
         probe1 = self.probe()
         final_delta = probe1.debt - probe0.debt
         event = {
@@ -375,6 +404,7 @@ def make_config(args: argparse.Namespace) -> RuntimeConfig:
         dtype="float64" if args.fp64 else "float32",
         device="cuda" if args.cuda else "cpu",
         closure_steps=args.closure_steps,
+        stabilizer_steps=args.stabilizer_steps,
         consolidation_every=args.consolidation_every,
     )
 
@@ -389,6 +419,7 @@ def main() -> None:
         q.add_argument("--cuda", action="store_true")
         q.add_argument("--fp64", action="store_true")
         q.add_argument("--closure-steps", type=int, default=1)
+        q.add_argument("--stabilizer-steps", type=int, default=1)
         q.add_argument("--consolidation-every", type=int, default=16)
 
     q = sub.add_parser("init")
