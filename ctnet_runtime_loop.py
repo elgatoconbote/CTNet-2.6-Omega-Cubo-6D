@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CTNet runtime loop v0.4.
+CTNet runtime loop v0.4.1.
 
 Ciclo operativo persistente para CTNet-Omega-Cubo6D + MTHD:
 observacion -> pliegue -> medicion -> simulacion de ciclo completo -> accion
@@ -19,6 +19,9 @@ v0.3 introdujo dos reguladores necesarios:
 v0.4 fija el principio arquitectonico central: la deuda que gobierna accion,
 simulacion e inhibicion nace del tensor de coherencia + cierre u/p. Las señales
 del Cubo6D quedan como diagnostico, no como ley de decision primaria.
+
+v0.4.1 resuelve de forma robusta el nucleo fractal real: en algunos layouts esta
+en base.core, y en otros en base.core.core.
 """
 from __future__ import annotations
 
@@ -251,10 +254,20 @@ class CTNetRuntimeLoop:
         with self.log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
+    def fractal_core(self) -> Any:
+        """Devuelve el modulo que contiene latent y coherence_energy."""
+        candidate = self.model.base.core
+        if hasattr(candidate, "latent") and hasattr(candidate, "coherence_energy"):
+            return candidate
+        inner = getattr(candidate, "core", None)
+        if inner is not None and hasattr(inner, "latent") and hasattr(inner, "coherence_energy"):
+            return inner
+        raise AttributeError("No se encontro nucleo CTNet fractal con latent y coherence_energy")
+
     @torch.no_grad()
     def up_metrics(self, xi: torch.Tensor) -> Dict[str, float]:
         """Mide el cierre u/p explicito: u debe reconstruirse desde p y p desde u."""
-        core = self.model.base.core
+        core = self.fractal_core()
         d2 = int(core.d) // 2
         u, p = xi[..., :d2], xi[..., d2:]
         u_hat = core.latent(p)
@@ -280,7 +293,8 @@ class CTNetRuntimeLoop:
 
         # Ley de gobierno: tensor de coherencia + u/p sobre Xi.
         xi = self.model.pack(state)
-        coh, speed, info_energy = self.model.base.core.coherence_energy(xi)
+        core = self.fractal_core()
+        coh, speed, info_energy = core.coherence_energy(xi)
         up = self.up_metrics(xi)
 
         coherence = safe_float(coh.detach().cpu())
