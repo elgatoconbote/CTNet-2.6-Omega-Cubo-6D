@@ -8,3 +8,10 @@ checkpoints/
 *.ckpt
 .env
 .DS_Store
+
+# CTNet local living state and non-destructive drill copies
+.ctnet_runtime/
+.ctnet_runtime*/
+
+# Local helper wrappers
+run_ctnet_runtime.sh
